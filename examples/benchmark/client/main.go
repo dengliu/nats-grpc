@@ -31,10 +31,8 @@ var (
 )
 
 func init() {
-	// Register standard gRPC client metrics from go-grpc-prometheus
-	prometheus.MustRegister(grpc_prometheus.DefaultClientMetrics)
-	
 	// Register our custom active clients gauge
+	// Note: grpc_prometheus.DefaultClientMetrics is already registered globally
 	prometheus.MustRegister(activeClients)
 }
 
