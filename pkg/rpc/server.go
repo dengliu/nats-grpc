@@ -289,6 +289,9 @@ func (s *serverStream) onRequest(msg *nats.Msg, request *nrpc.Request) {
 	case *nrpc.Request_End:
 		//s.log.WithField("end", r.End).Info("recv end")
 		s.processEnd(r.End)
+	case *nrpc.Request_Ping:
+		//s.log.WithField("ping", r.Ping).Debug("recv ping")
+		s.processPing(r.Ping)
 	}
 }
 
@@ -337,6 +340,13 @@ func (s *serverStream) processEnd(end *nrpc.End) {
 			s.recvWrite = nil
 		}
 	}
+}
+
+func (s *serverStream) processPing(ping *nrpc.Ping) {
+	// Immediately respond with pong
+	s.writePong(&nrpc.Pong{
+		Timestamp: ping.Timestamp,
+	})
 }
 
 func (s *serverStream) beginMaybe() error {
@@ -470,6 +480,14 @@ func (s *serverStream) writeEnd(end *nrpc.End) error {
 	return s.writeResponse(&nrpc.Response{
 		Type: &nrpc.Response_End{
 			End: end,
+		},
+	})
+}
+
+func (s *serverStream) writePong(pong *nrpc.Pong) error {
+	return s.writeResponse(&nrpc.Response{
+		Type: &nrpc.Response_Pong{
+			Pong: pong,
 		},
 	})
 }

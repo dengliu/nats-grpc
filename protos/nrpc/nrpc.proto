@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package nrpc;
 
+option go_package = "github.com/cloudwebrtc/nats-grpc/pkg/protos/nrpc";
+
 import "google/rpc/status.proto";
 
 message Request {
@@ -9,6 +11,7 @@ message Request {
 		Call call = 2;
 		Data data = 3;
 		End end = 4;
+		Ping ping = 5;
 	}
 }
 
@@ -17,6 +20,7 @@ message Response {
 		Begin begin = 2;
 		Data data = 3;
 		End end = 4;
+		Pong pong = 5;
 	}
 }
 
@@ -46,4 +50,12 @@ message Data {
 message End {
 	google.rpc.Status status = 1;
 	Metadata trailer = 2;
+}
+
+message Ping {
+	int64 timestamp = 1;
+}
+
+message Pong {
+	int64 timestamp = 1;
 }

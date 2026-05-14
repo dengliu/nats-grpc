@@ -7,6 +7,7 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/cloudwebrtc/nats-grpc/pkg/protos/nrpc"
 	"github.com/cloudwebrtc/nats-grpc/pkg/utils"
@@ -102,32 +103,41 @@ func (c *Client) NewStream(ctx context.Context, desc *grpc.StreamDesc, method st
 }
 
 type clientStream struct {
-	md        *metadata.MD
-	header    *metadata.MD
-	trailer   *metadata.MD
-	lastErr   error
-	ctx       context.Context
-	cancel    context.CancelFunc
-	log       *logrus.Logger
-	client    *Client
-	subject   string
-	reply     string
-	msgCh     chan *nats.Msg
-	sub       *nats.Subscription
-	closed    bool
-	recvRead  <-chan []byte
-	recvWrite chan<- []byte
-	hasBegun  bool
-	pnid      string
+	md            *metadata.MD
+	header        *metadata.MD
+	trailer       *metadata.MD
+	lastErr       error
+	ctx           context.Context
+	cancel        context.CancelFunc
+	log           *logrus.Logger
+	client        *Client
+	subject       string
+	reply         string
+	msgCh         chan *nats.Msg
+	sub           *nats.Subscription
+	closed        bool
+	recvRead      <-chan []byte
+	recvWrite     chan []byte
+	hasBegun      bool
+	pnid          string
+	lastPongTime  time.Time
+	pongMu        sync.Mutex
+	pingInterval  time.Duration
+	pongTimeout   time.Duration
+	heartbeatStop chan struct{}
 }
 
 func newClientStream(ctx context.Context, client *Client, subj string, log *logrus.Logger, opts ...grpc.CallOption) *clientStream {
 	stream := &clientStream{
-		client:  client,
-		log:     log,
-		subject: subj,
-		reply:   utils.NewInBox(),
-		closed:  false,
+		client:        client,
+		log:           log,
+		subject:       subj,
+		reply:         utils.NewInBox(),
+		closed:        false,
+		pingInterval:  2 * time.Second,
+		pongTimeout:   5 * time.Second,
+		lastPongTime:  time.Now(),
+		heartbeatStop: make(chan struct{}),
 	}
 	stream.ctx, stream.cancel = context.WithCancel(ctx)
 
@@ -163,6 +173,8 @@ func newClientStream(ctx context.Context, client *Client, subj string, log *logr
 	}
 
 	go stream.ReadMsg()
+	go stream.pingLoop()
+	go stream.pongMonitor()
 	return stream
 }
 
@@ -217,6 +229,9 @@ func (c *clientStream) onMessage(msg *nats.Msg) error {
 	case *nrpc.Response_End:
 		//c.log.WithField("end", r.End).Info("recv end")
 		return c.processEnd(r.End)
+	case *nrpc.Response_Pong:
+		//c.log.WithField("pong", r.Pong).Debug("recv pong")
+		c.processPong(r.Pong)
 	}
 	return nil
 }
@@ -244,6 +259,7 @@ func (c *clientStream) done() error {
 	if !c.closed {
 		c.closed = true
 		c.cancel()
+		close(c.heartbeatStop) // Stop heartbeat goroutines
 		err := c.sub.Unsubscribe()
 		close(c.msgCh)
 		c.client.remove(c.subject)
@@ -418,4 +434,70 @@ func (c *clientStream) processEnd(end *nrpc.End) error {
 	close(c.recvWrite)
 	c.recvWrite = nil
 	return nil
+}
+
+// pingLoop periodically sends Ping messages to the server
+func (c *clientStream) pingLoop() {
+	ticker := time.NewTicker(c.pingInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.heartbeatStop:
+			return
+		case <-c.ctx.Done():
+			return
+		case <-ticker.C:
+			if c.closed {
+				return
+			}
+			err := c.writePing(&nrpc.Ping{
+				Timestamp: time.Now().UnixNano(),
+			})
+			if err != nil {
+				c.log.WithError(err).Debug("failed to send ping")
+			}
+		}
+	}
+}
+
+// pongMonitor monitors for Pong timeout and closes stream if no Pong received
+func (c *clientStream) pongMonitor() {
+	ticker := time.NewTicker(c.pingInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.heartbeatStop:
+			return
+		case <-c.ctx.Done():
+			return
+		case <-ticker.C:
+			c.pongMu.Lock()
+			elapsed := time.Since(c.lastPongTime)
+			c.pongMu.Unlock()
+
+			if elapsed > c.pongTimeout {
+				c.log.WithField("elapsed", elapsed).Error("heartbeat timeout: no pong received")
+				c.close(status.Error(codes.Unavailable, "server heartbeat timeout"))
+				return
+			}
+		}
+	}
+}
+
+// processPong handles incoming Pong messages by updating lastPongTime
+func (c *clientStream) processPong(pong *nrpc.Pong) {
+	c.pongMu.Lock()
+	c.lastPongTime = time.Now()
+	c.pongMu.Unlock()
+}
+
+// writePing sends a Ping request to the server
+func (c *clientStream) writePing(ping *nrpc.Ping) error {
+	return c.writeRequest(&nrpc.Request{
+		Type: &nrpc.Request_Ping{
+			Ping: ping,
+		},
+	})
 }

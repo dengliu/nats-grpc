@@ -11,5 +11,6 @@ mkdir -p ${OUT_DIR}
 touch ${OUT_DIR}/.generated
 
 protoc -I ${SRC_DIR} \
-	--go_out=plugins=grpc:${OUT_DIR} \
+	--go_out=${OUT_DIR} \
+	--go_opt=paths=source_relative \
 	${SRC_DIR}/nrpc/nrpc.proto
