@@ -13,6 +13,7 @@ import (
 
 	"github.com/cloudwebrtc/nats-grpc/examples/protos/benchmark"
 	"github.com/cloudwebrtc/nats-grpc/pkg/rpc"
+	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
 	"github.com/nats-io/nats.go"
 	log "github.com/pion/ion-log"
 	"github.com/prometheus/client_golang/prometheus"
@@ -20,32 +21,7 @@ import (
 )
 
 var (
-	requestCounter = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "grpc_client_requests_total",
-			Help: "Total number of gRPC requests sent",
-		},
-		[]string{"client_id", "method", "status"},
-	)
-
-	requestDuration = prometheus.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Name:    "grpc_client_request_duration_seconds",
-			Help:    "Duration of gRPC requests in seconds",
-			Buckets: prometheus.DefBuckets,
-		},
-		[]string{"client_id", "method"},
-	)
-
-	payloadSize = prometheus.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Name:    "grpc_client_payload_bytes",
-			Help:    "Size of gRPC request/response payloads in bytes",
-			Buckets: []float64{1024, 4096, 8192, 16384, 32768, 65536},
-		},
-		[]string{"client_id", "direction"},
-	)
-
+	// Keep activeClients as it tracks concurrent client count
 	activeClients = prometheus.NewGauge(
 		prometheus.GaugeOpts{
 			Name: "grpc_client_active_total",
@@ -55,9 +31,10 @@ var (
 )
 
 func init() {
-	prometheus.MustRegister(requestCounter)
-	prometheus.MustRegister(requestDuration)
-	prometheus.MustRegister(payloadSize)
+	// Register standard gRPC client metrics from go-grpc-prometheus
+	prometheus.MustRegister(grpc_prometheus.DefaultClientMetrics)
+	
+	// Register our custom active clients gauge
 	prometheus.MustRegister(activeClients)
 }
 
@@ -75,8 +52,10 @@ func runClient(clientID string, serverID string, requestPayload []byte, natsURL 
 	}
 	defer nc.Close()
 
-	// Create nats-grpc client targeting specific serverID
-	ncli := rpc.NewClient(nc, serverID, clientID)
+	// Create nats-grpc client with Prometheus interceptor
+	ncli := rpc.NewClientWithOptions(nc, serverID, clientID,
+		rpc.WithUnaryInterceptor(grpc_prometheus.UnaryClientInterceptor),
+	)
 	defer ncli.Close()
 
 	cli := benchmark.NewBenchmarkClient(ncli)
@@ -90,21 +69,13 @@ func runClient(clientID string, serverID string, requestPayload []byte, natsURL 
 	for range ticker.C {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 
-		start := time.Now()
-		resp, err := cli.Execute(ctx, &benchmark.BenchmarkRequest{
+		_, err := cli.Execute(ctx, &benchmark.BenchmarkRequest{
 			ServerId: serverID,
 			Payload:  requestPayload,
 		})
-		duration := time.Since(start)
 
 		if err != nil {
-			requestCounter.WithLabelValues(clientID, "Execute", "error").Inc()
 			log.Errorf("Client %s: request failed: %v", clientID, err)
-		} else {
-			requestCounter.WithLabelValues(clientID, "Execute", "success").Inc()
-			requestDuration.WithLabelValues(clientID, "Execute").Observe(duration.Seconds())
-			payloadSize.WithLabelValues(clientID, "request").Observe(float64(len(requestPayload)))
-			payloadSize.WithLabelValues(clientID, "response").Observe(float64(len(resp.Payload)))
 		}
 
 		cancel()
