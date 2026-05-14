@@ -44,7 +44,8 @@ func (s *serverTransportStream) SetTrailer(md metadata.MD) error {
 
 func serverUnaryHandler(srv interface{}, handler serverMethodHandler) handlerFunc {
 	return func(s *serverStream) {
-		var interceptor grpc.UnaryServerInterceptor = nil
+		// Use the server's unary interceptor if set
+		interceptor := s.server.unaryInt
 		ctx := grpc.NewContextWithServerTransportStream(s.Context(), &serverTransportStream{stream: s})
 		if s.md != nil {
 			ctx = metadata.NewIncomingContext(ctx, s.md)
@@ -64,6 +65,20 @@ func serverUnaryHandler(srv interface{}, handler serverMethodHandler) handlerFun
 
 func serverStreamHandler(srv interface{}, handler grpc.StreamHandler) handlerFunc {
 	return func(s *serverStream) {
+		// If stream interceptor is set, use it
+		if s.server.streamInt != nil {
+			info := &grpc.StreamServerInfo{
+				FullMethod:     s.method,
+				IsClientStream: true, // conservative assumption
+				IsServerStream: true,
+			}
+			err := s.server.streamInt(srv, s, info, handler)
+			if s.ctx.Err() == nil {
+				s.close(err)
+			}
+			return
+		}
+		// Otherwise call handler directly
 		err := handler(srv, s)
 		if s.ctx.Err() == nil {
 			s.close(err)
@@ -85,20 +100,44 @@ type serviceInfo struct {
 
 // Server is the interface to gRPC over NATS
 type Server struct {
-	nc       NatsConn
-	ctx      context.Context
-	cancel   context.CancelFunc
-	log      *logrus.Logger
-	handlers map[string]handlerFunc
-	streams  map[string]*serverStream
-	mu       sync.Mutex
-	subs     map[string]*nats.Subscription
-	nid      string
-	services map[string]*serviceInfo // service name -> service info
+	nc        NatsConn
+	ctx       context.Context
+	cancel    context.CancelFunc
+	log       *logrus.Logger
+	handlers  map[string]handlerFunc
+	streams   map[string]*serverStream
+	mu        sync.Mutex
+	subs      map[string]*nats.Subscription
+	nid       string
+	services  map[string]*serviceInfo // service name -> service info
+	unaryInt  grpc.UnaryServerInterceptor
+	streamInt grpc.StreamServerInterceptor
 }
 
 // NewServer creates a new Proxy
 func NewServer(nc NatsConn, nid string) *Server {
+	return NewServerWithOptions(nc, nid)
+}
+
+// ServerOption is a functional option for configuring a Server
+type ServerOption func(*Server)
+
+// WithUnaryServerInterceptor returns a ServerOption that specifies the unary interceptor for the server
+func WithUnaryServerInterceptor(interceptor grpc.UnaryServerInterceptor) ServerOption {
+	return func(s *Server) {
+		s.unaryInt = interceptor
+	}
+}
+
+// WithStreamServerInterceptor returns a ServerOption that specifies the stream interceptor for the server
+func WithStreamServerInterceptor(interceptor grpc.StreamServerInterceptor) ServerOption {
+	return func(s *Server) {
+		s.streamInt = interceptor
+	}
+}
+
+// NewServerWithOptions creates a new Server with options
+func NewServerWithOptions(nc NatsConn, nid string, opts ...ServerOption) *Server {
 	s := &Server{
 		nc:       nc,
 		handlers: make(map[string]handlerFunc),
@@ -109,6 +148,12 @@ func NewServer(nc NatsConn, nid string) *Server {
 		nid:      nid,
 	}
 	s.ctx, s.cancel = context.WithCancel(context.Background())
+	
+	// Apply options
+	for _, opt := range opts {
+		opt(s)
+	}
+	
 	return s
 }
 

@@ -12,45 +12,11 @@ import (
 
 	"github.com/cloudwebrtc/nats-grpc/examples/protos/benchmark"
 	"github.com/cloudwebrtc/nats-grpc/pkg/rpc"
+	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
 	"github.com/nats-io/nats.go"
-	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	log "github.com/pion/ion-log"
 )
-
-var (
-	requestCounter = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "grpc_server_requests_total",
-			Help: "Total number of gRPC requests received",
-		},
-		[]string{"server_id", "method"},
-	)
-
-	requestDuration = prometheus.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Name:    "grpc_server_request_duration_seconds",
-			Help:    "Duration of gRPC requests in seconds",
-			Buckets: prometheus.DefBuckets,
-		},
-		[]string{"server_id", "method"},
-	)
-
-	payloadSize = prometheus.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Name:    "grpc_server_payload_bytes",
-			Help:    "Size of gRPC request/response payloads in bytes",
-			Buckets: []float64{1024, 4096, 8192, 16384, 32768, 65536},
-		},
-		[]string{"server_id", "direction"},
-	)
-)
-
-func init() {
-	prometheus.MustRegister(requestCounter)
-	prometheus.MustRegister(requestDuration)
-	prometheus.MustRegister(payloadSize)
-}
 
 type benchmarkServer struct {
 	benchmark.UnimplementedBenchmarkServer
@@ -59,13 +25,6 @@ type benchmarkServer struct {
 }
 
 func (s *benchmarkServer) Execute(ctx context.Context, req *benchmark.BenchmarkRequest) (*benchmark.BenchmarkResponse, error) {
-	timer := prometheus.NewTimer(requestDuration.WithLabelValues(s.serverID, "Execute"))
-	defer timer.ObserveDuration()
-
-	requestCounter.WithLabelValues(s.serverID, "Execute").Inc()
-	payloadSize.WithLabelValues(s.serverID, "request").Observe(float64(len(req.Payload)))
-	payloadSize.WithLabelValues(s.serverID, "response").Observe(float64(len(s.responseBytes)))
-
 	return &benchmark.BenchmarkResponse{
 		ServerId: s.serverID,
 		Payload:  s.responseBytes,
@@ -81,7 +40,7 @@ func main() {
 	)
 	flag.Parse()
 
-	// Start metrics server
+	// Start metrics server with standard gRPC server metrics
 	http.Handle("/metrics", promhttp.Handler())
 	go func() {
 		addr := fmt.Sprintf(":%d", *metricsPort)
@@ -120,8 +79,10 @@ func main() {
 			}
 			defer nc.Close()
 
-			// Create nats-grpc server with unique serverID
-			ncs := rpc.NewServer(nc, serverID)
+			// Create nats-grpc server with Prometheus interceptor
+			ncs := rpc.NewServerWithOptions(nc, serverID,
+				rpc.WithUnaryServerInterceptor(grpc_prometheus.UnaryServerInterceptor),
+			)
 			servers[index] = ncs
 
 			// Register benchmark service
