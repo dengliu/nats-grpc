@@ -22,17 +22,40 @@ import (
 )
 
 type Client struct {
-	nc      NatsConn
-	ctx     context.Context
-	cancel  context.CancelFunc
-	log     *logrus.Logger
-	streams map[string]*clientStream
-	svcid   string
-	nid     string
-	mu      sync.Mutex
+	nc        NatsConn
+	ctx       context.Context
+	cancel    context.CancelFunc
+	log       *logrus.Logger
+	streams   map[string]*clientStream
+	svcid     string
+	nid       string
+	mu        sync.Mutex
+	unaryInt  grpc.UnaryClientInterceptor
+	streamInt grpc.StreamClientInterceptor
 }
 
 func NewClient(nc NatsConn, svcid string, nid string) *Client {
+	return NewClientWithOptions(nc, svcid, nid)
+}
+
+// ClientOption is a functional option for configuring a Client
+type ClientOption func(*Client)
+
+// WithUnaryInterceptor returns a ClientOption that specifies the unary interceptor for the client
+func WithUnaryInterceptor(interceptor grpc.UnaryClientInterceptor) ClientOption {
+	return func(c *Client) {
+		c.unaryInt = interceptor
+	}
+}
+
+// WithStreamInterceptor returns a ClientOption that specifies the stream interceptor for the client
+func WithStreamInterceptor(interceptor grpc.StreamClientInterceptor) ClientOption {
+	return func(c *Client) {
+		c.streamInt = interceptor
+	}
+}
+
+func NewClientWithOptions(nc NatsConn, svcid string, nid string, opts ...ClientOption) *Client {
 	c := &Client{
 		nc:      nc,
 		svcid:   svcid,
@@ -41,6 +64,12 @@ func NewClient(nc NatsConn, svcid string, nid string) *Client {
 		log:     log.NewLoggerWithFields(log.DebugLevel, "nats-grpc.Client", log.Fields{"svc-id": svcid, "self-nid": nid}),
 	}
 	c.ctx, c.cancel = context.WithCancel(context.Background())
+	
+	// Apply options
+	for _, opt := range opts {
+		opt(c)
+	}
+	
 	return c
 }
 
@@ -76,6 +105,16 @@ func (c *Client) remove(subj string) {
 // Invoke performs a unary RPC and returns after the request is received
 // into reply.
 func (c *Client) Invoke(ctx context.Context, method string, args interface{}, reply interface{}, opts ...grpc.CallOption) error {
+	// If interceptor is set, use it
+	if c.unaryInt != nil {
+		return c.unaryInt(ctx, method, args, reply, nil, c.invoker, opts...)
+	}
+	// Otherwise, call directly
+	return c.invoker(ctx, method, args, reply, nil, opts...)
+}
+
+// invoker is the actual RPC invocation logic
+func (c *Client) invoker(ctx context.Context, method string, args interface{}, reply interface{}, _ *grpc.ClientConn, opts ...grpc.CallOption) error {
 	prefix := "nrpc"
 	if len(c.svcid) > 0 {
 		prefix = fmt.Sprintf("nrpc.%v", c.svcid)
@@ -90,6 +129,16 @@ func (c *Client) Invoke(ctx context.Context, method string, args interface{}, re
 
 //NewStream begins a streaming RPC.
 func (c *Client) NewStream(ctx context.Context, desc *grpc.StreamDesc, method string, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+	// If stream interceptor is set, use it
+	if c.streamInt != nil {
+		return c.streamInt(ctx, desc, nil, method, c.streamer, opts...)
+	}
+	// Otherwise, call directly
+	return c.streamer(ctx, desc, nil, method, opts...)
+}
+
+// streamer is the actual stream creation logic
+func (c *Client) streamer(ctx context.Context, desc *grpc.StreamDesc, _ *grpc.ClientConn, method string, opts ...grpc.CallOption) (grpc.ClientStream, error) {
 	prefix := "nrpc"
 	if len(c.svcid) > 0 {
 		prefix = fmt.Sprintf("nrpc.%v", c.svcid)
