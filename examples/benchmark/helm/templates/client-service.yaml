@@ -1,0 +1,20 @@
+{{- if .Values.client.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "nats-grpc-benchmark.fullname" . }}-client
+  labels:
+    app: {{ include "nats-grpc-benchmark.name" . }}-client
+    chart: {{ include "nats-grpc-benchmark.chart" . }}
+    release: {{ .Release.Name }}
+spec:
+  type: {{ .Values.client.service.type }}
+  ports:
+    - port: {{ .Values.client.service.metricsPort }}
+      targetPort: metrics
+      protocol: TCP
+      name: metrics
+  selector:
+    app: {{ include "nats-grpc-benchmark.name" . }}-client
+    release: {{ .Release.Name }}
+{{- end }}

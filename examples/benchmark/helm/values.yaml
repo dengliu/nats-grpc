@@ -1,0 +1,57 @@
+# Default values for nats-grpc-benchmark
+
+# Image configuration
+image:
+  repository: nats-grpc-benchmark
+  pullPolicy: IfNotPresent
+  tag: "latest"
+
+# NATS server connection
+nats:
+  url: "nats://nats:4222"
+
+# Server configuration
+server:
+  enabled: true
+  replicaCount: 10
+  serverCount: 100  # Number of servers per pod
+  payloadSize: 4096
+  metricsPort: 9090
+  
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+  
+  service:
+    type: ClusterIP
+    metricsPort: 9090
+
+# Client configuration
+client:
+  enabled: true
+  replicaCount: 10
+  clientCount: 100  # Number of clients per pod
+  payloadSize: 4096
+  metricsPort: 9091
+  
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+  
+  service:
+    type: ClusterIP
+    metricsPort: 9091
+
+# ServiceMonitor for Prometheus Operator (optional)
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  scrapeTimeout: 10s

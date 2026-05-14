@@ -1,0 +1,12 @@
+apiVersion: v2
+name: nats-grpc-benchmark
+description: A Helm chart for nats-grpc benchmark client and server
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+keywords:
+  - nats
+  - grpc
+  - benchmark
+maintainers:
+  - name: nats-grpc

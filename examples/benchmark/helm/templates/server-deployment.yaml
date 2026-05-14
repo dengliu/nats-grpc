@@ -1,0 +1,54 @@
+{{- if .Values.server.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "nats-grpc-benchmark.fullname" . }}-server
+  labels:
+    app: {{ include "nats-grpc-benchmark.name" . }}-server
+    chart: {{ include "nats-grpc-benchmark.chart" . }}
+    release: {{ .Release.Name }}
+spec:
+  replicas: {{ .Values.server.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ include "nats-grpc-benchmark.name" . }}-server
+      release: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app: {{ include "nats-grpc-benchmark.name" . }}-server
+        release: {{ .Release.Name }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "{{ .Values.server.metricsPort }}"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+      - name: server
+        image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        command: ["/app/benchmark-server"]
+        args:
+          - "--nats-url={{ .Values.nats.url }}"
+          - "--server-count={{ .Values.server.serverCount }}"
+          - "--payload-size={{ .Values.server.payloadSize }}"
+          - "--metrics-port={{ .Values.server.metricsPort }}"
+        ports:
+        - name: metrics
+          containerPort: {{ .Values.server.metricsPort }}
+          protocol: TCP
+        resources:
+          {{- toYaml .Values.server.resources | nindent 10 }}
+        livenessProbe:
+          httpGet:
+            path: /metrics
+            port: metrics
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /metrics
+            port: metrics
+          initialDelaySeconds: 5
+          periodSeconds: 5
+{{- end }}
