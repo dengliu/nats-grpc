@@ -20,8 +20,8 @@ docker build -t nats-grpc-benchmark:latest -f examples/benchmark/Dockerfile .
 If using a registry:
 
 ```bash
-docker build -t your-registry/nats-grpc-benchmark:latest -f examples/benchmark/Dockerfile .
-docker push your-registry/nats-grpc-benchmark:latest
+docker build -t us-central1-docker.pkg.dev/encoded-stage-394013/containers/nats-grpc-benchmark:latest -f examples/benchmark/Dockerfile .
+docker push us-central1-docker.pkg.dev/encoded-stage-394013/containers/nats-grpc-benchmark:latest
 ```
 
 ## Installing the Chart
