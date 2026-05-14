@@ -14,10 +14,12 @@ import (
 	"github.com/cloudwebrtc/nats-grpc/examples/protos/benchmark"
 	"github.com/cloudwebrtc/nats-grpc/pkg/rpc"
 	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
+	"github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/timeout"
 	"github.com/nats-io/nats.go"
 	log "github.com/pion/ion-log"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"google.golang.org/grpc"
 )
 
 var (
@@ -50,9 +52,19 @@ func runClient(clientID string, serverID string, requestPayload []byte, natsURL 
 	}
 	defer nc.Close()
 
-	// Create nats-grpc client with Prometheus interceptor
+	// Chain timeout and Prometheus interceptors
+	chainedInterceptor := func(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+		// Apply timeout interceptor first
+		timeoutInt := timeout.UnaryClientInterceptor(5 * time.Second)
+		return timeoutInt(ctx, method, req, reply, cc, func(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, opts ...grpc.CallOption) error {
+			// Then apply Prometheus interceptor
+			return grpc_prometheus.UnaryClientInterceptor(ctx, method, req, reply, cc, invoker, opts...)
+		}, opts...)
+	}
+
+	// Create nats-grpc client with chained interceptors
 	ncli := rpc.NewClientWithOptions(nc, serverID, clientID,
-		rpc.WithUnaryInterceptor(grpc_prometheus.UnaryClientInterceptor),
+		rpc.WithUnaryInterceptor(chainedInterceptor),
 	)
 	defer ncli.Close()
 
@@ -65,9 +77,8 @@ func runClient(clientID string, serverID string, requestPayload []byte, natsURL 
 	log.Infof("Client %s started, targeting %s", clientID, serverID)
 
 	for range ticker.C {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-
-		_, err := cli.Execute(ctx, &benchmark.BenchmarkRequest{
+		// No manual timeout needed - handled by timeout interceptor
+		_, err := cli.Execute(context.Background(), &benchmark.BenchmarkRequest{
 			ServerId: serverID,
 			Payload:  requestPayload,
 		})
@@ -75,8 +86,6 @@ func runClient(clientID string, serverID string, requestPayload []byte, natsURL 
 		if err != nil {
 			log.Errorf("Client %s: request failed: %v", clientID, err)
 		}
-
-		cancel()
 	}
 }
 
