@@ -1,0 +1,19 @@
+syntax = "proto3";
+
+option go_package = ".;benchmark";
+
+package benchmark;
+
+service Benchmark {
+    rpc Execute(BenchmarkRequest) returns (BenchmarkResponse) {}
+}
+
+message BenchmarkRequest {
+    string server_id = 1;
+    bytes payload = 2;
+}
+
+message BenchmarkResponse {
+    string server_id = 1;
+    bytes payload = 2;
+}
