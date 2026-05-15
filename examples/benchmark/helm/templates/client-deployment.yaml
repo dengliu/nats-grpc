@@ -1,6 +1,6 @@
 {{- if .Values.client.enabled }}
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: {{ include "nats-grpc-benchmark.fullname" . }}-client
   labels:
@@ -8,6 +8,8 @@ metadata:
     chart: {{ include "nats-grpc-benchmark.chart" . }}
     release: {{ .Release.Name }}
 spec:
+  serviceName: {{ include "nats-grpc-benchmark.fullname" . }}-client
+  podManagementPolicy: Parallel
   replicas: {{ .Values.client.replicaCount }}
   selector:
     matchLabels:
@@ -47,6 +49,11 @@ spec:
           - "--payload-size={{ .Values.client.payloadSize }}"
           - "--metrics-port={{ .Values.client.metricsPort }}"
           - "--request-timeout={{ .Values.client.requestTimeout }}"
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
         ports:
         - name: metrics
           containerPort: {{ .Values.client.metricsPort }}

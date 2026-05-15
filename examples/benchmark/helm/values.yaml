@@ -54,7 +54,7 @@ client:
 # ServiceMonitor for Prometheus Operator (optional)
 serviceMonitor:
   enabled: false
-  interval: 30s
+  interval: 10s
   scrapeTimeout: 10s
 
 # Datadog configuration for metrics export

@@ -183,8 +183,8 @@ func newClientStream(ctx context.Context, client *Client, subj string, log *logr
 		subject:       subj,
 		reply:         utils.NewInBox(),
 		closed:        false,
-		pingInterval:  2 * time.Second,
-		pongTimeout:   5 * time.Second,
+		pingInterval:  5 * time.Second,
+		pongTimeout:   15 * time.Second,
 		lastPongTime:  time.Now(),
 		heartbeatStop: make(chan struct{}),
 	}
@@ -360,7 +360,12 @@ func (c *clientStream) RecvMsg(m interface{}) error {
 		if c.lastErr != nil {
 			return c.lastErr
 		}
-		return c.ctx.Err()
+		// Convert context errors to gRPC status codes for proper metrics reporting
+		if c.ctx.Err() == context.DeadlineExceeded {
+			c.log.Errorf("context deadline exceeded for c.RecvMsg")
+			return status.Error(codes.DeadlineExceeded, "deadline exceeded")
+		}
+		return status.Error(codes.Canceled, "context canceled")
 	case bytes, ok := <-c.recvRead:
 		if !ok {
 			return io.EOF

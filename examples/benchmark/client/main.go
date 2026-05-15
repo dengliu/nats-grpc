@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -21,6 +23,25 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"google.golang.org/grpc"
 )
+
+// podOrdinalOffset returns the global ID offset for this pod, derived from the
+// trailing ordinal of POD_NAME (set by the StatefulSet via the downward API).
+// Pod "<sts>-0" hosts IDs [0, n); "<sts>-1" hosts [n, 2n); etc.
+func podOrdinalOffset(n int) int {
+	name := os.Getenv("POD_NAME")
+	if name == "" {
+		return 0
+	}
+	i := strings.LastIndex(name, "-")
+	if i == -1 {
+		return 0
+	}
+	ord, err := strconv.Atoi(name[i+1:])
+	if err != nil {
+		return 0
+	}
+	return ord * n
+}
 
 var (
 	// Keep activeClients as it tracks concurrent client count
@@ -115,13 +136,14 @@ func main() {
 		requestPayload[i] = byte(i % 256)
 	}
 
-	log.Infof("Starting %d benchmark clients...", *clientCount)
+	offset := podOrdinalOffset(*clientCount)
+	log.Infof("Starting %d benchmark clients (IDs %d..%d)...", *clientCount, offset, offset+*clientCount-1)
 
 	var wg sync.WaitGroup
 
 	for i := 0; i < *clientCount; i++ {
-		clientID := fmt.Sprintf("benchmark-client-%d", i)
-		serverID := fmt.Sprintf("benchmark-server-%d", i)
+		clientID := fmt.Sprintf("benchmark-client-%d", offset+i)
+		serverID := fmt.Sprintf("benchmark-server-%d", offset+i)
 
 		activeClients.Inc()
 		wg.Add(1)

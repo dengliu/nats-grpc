@@ -1,6 +1,6 @@
 {{- if .Values.server.enabled }}
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: {{ include "nats-grpc-benchmark.fullname" . }}-server
   labels:
@@ -8,6 +8,8 @@ metadata:
     chart: {{ include "nats-grpc-benchmark.chart" . }}
     release: {{ .Release.Name }}
 spec:
+  serviceName: {{ include "nats-grpc-benchmark.fullname" . }}-server
+  podManagementPolicy: Parallel
   replicas: {{ .Values.server.replicaCount }}
   selector:
     matchLabels:
@@ -46,6 +48,11 @@ spec:
           - "--server-count={{ .Values.server.serverCount }}"
           - "--payload-size={{ .Values.server.payloadSize }}"
           - "--metrics-port={{ .Values.server.metricsPort }}"
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
         ports:
         - name: metrics
           containerPort: {{ .Values.server.metricsPort }}
