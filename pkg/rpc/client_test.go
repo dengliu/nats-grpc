@@ -6,12 +6,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cloudwebrtc/nats-grpc/pkg/protos/nrpc"
 	"github.com/nats-io/nats.go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 )
 
 // MockNatsConn is a mock implementation of NatsConn
@@ -47,6 +50,14 @@ func (m *MockNatsConn) Subscribe(subj string, cb nats.MsgHandler) (*nats.Subscri
 
 func (m *MockNatsConn) Request(subj string, data []byte, timeout time.Duration) (*nats.Msg, error) {
 	args := m.Called(subj, data, timeout)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*nats.Msg), args.Error(1)
+}
+
+func (m *MockNatsConn) RequestWithContext(ctx context.Context, subj string, data []byte) (*nats.Msg, error) {
+	args := m.Called(ctx, subj, data)
 	if args.Get(0) == nil {
 		return nil, args.Error(1)
 	}
@@ -496,15 +507,189 @@ func TestClientOption_Application(t *testing.T) {
 // Test NewStream without interceptor creates proper stream structure
 func TestNewStream_WithoutInterceptor(t *testing.T) {
 	mockNC := new(MockNatsConn)
-	
+
 	client := NewClient(mockNC, "test-service", "test-nid")
 	defer client.Close()
-	
+
 	// Verify client has no stream interceptor
 	assert.Nil(t, client.streamInt, "No stream interceptor should be set")
-	
+
 	// Verify the client is properly initialized for stream operations
 	assert.NotNil(t, client.streams, "Streams map should be initialized")
 	assert.Equal(t, "test-service", client.svcid)
 	assert.Equal(t, "test-nid", client.nid)
+}
+
+// --- Unary RPC path (Option 2: nc.RequestWithContext) ---------------------
+//
+// These tests cover Client.invoker after the switch to single-message
+// request/reply. They use nrpc.Ping / nrpc.Pong as concrete proto.Messages
+// because the unary path actually marshals args/reply via proto.
+
+// marshalUnaryResp returns wire bytes for an nrpc.Response carrying a
+// successful UnaryResponse wrapping payload.
+func marshalUnaryResp(t *testing.T, payload proto.Message) []byte {
+	t.Helper()
+	data, err := proto.Marshal(payload)
+	assert.NoError(t, err)
+	resp := &nrpc.Response{Type: &nrpc.Response_Unary{Unary: &nrpc.UnaryResponse{
+		Status: status.Convert(nil).Proto(),
+		Data:   data,
+	}}}
+	out, err := proto.Marshal(resp)
+	assert.NoError(t, err)
+	return out
+}
+
+// TestUnary_HappyPath drives the full invoker round-trip with a mocked NATS
+// reply and verifies the reply proto is populated and the subject is built
+// correctly.
+func TestUnary_HappyPath(t *testing.T) {
+	mockNC := new(MockNatsConn)
+
+	wantReply := &nrpc.Pong{Timestamp: 12345}
+	mockNC.On("RequestWithContext", mock.Anything, "nrpc.test-svc.test.Svc.Method", mock.Anything).
+		Return(&nats.Msg{Data: marshalUnaryResp(t, wantReply)}, nil)
+
+	client := NewClient(mockNC, "test-svc", "test-nid")
+	defer client.Close()
+
+	gotReply := &nrpc.Pong{}
+	err := client.Invoke(context.Background(), "/test.Svc/Method", &nrpc.Ping{Timestamp: 1}, gotReply)
+
+	assert.NoError(t, err)
+	assert.Equal(t, int64(12345), gotReply.Timestamp)
+	mockNC.AssertExpectations(t)
+}
+
+// TestUnary_RequestSerialization verifies the on-wire Request is Request_Unary
+// with method, data, and outgoing metadata correctly packed.
+func TestUnary_RequestSerialization(t *testing.T) {
+	mockNC := new(MockNatsConn)
+
+	var captured []byte
+	mockNC.On("RequestWithContext", mock.Anything, mock.Anything, mock.Anything).
+		Run(func(args mock.Arguments) {
+			captured = append([]byte(nil), args.Get(2).([]byte)...)
+		}).
+		Return(&nats.Msg{Data: marshalUnaryResp(t, &nrpc.Pong{})}, nil)
+
+	client := NewClient(mockNC, "svc", "nid")
+	defer client.Close()
+
+	ctx := metadata.AppendToOutgoingContext(context.Background(), "x-test", "v1")
+	err := client.Invoke(ctx, "/test.Svc/Method", &nrpc.Ping{Timestamp: 42}, &nrpc.Pong{})
+	assert.NoError(t, err)
+
+	req := &nrpc.Request{}
+	assert.NoError(t, proto.Unmarshal(captured, req))
+	ureq := req.GetUnary()
+	if assert.NotNil(t, ureq, "expected Request_Unary on the wire") {
+		assert.Equal(t, "/test.Svc/Method", ureq.Method)
+		if assert.NotNil(t, ureq.Metadata) {
+			assert.Equal(t, []string{"v1"}, ureq.Metadata.Md["x-test"].Values)
+		}
+		// Body bytes should round-trip back to the original Ping.
+		echo := &nrpc.Ping{}
+		assert.NoError(t, proto.Unmarshal(ureq.Data, echo))
+		assert.Equal(t, int64(42), echo.Timestamp)
+	}
+}
+
+// TestUnary_NoResponders maps nats.ErrNoResponders to codes.Unavailable.
+func TestUnary_NoResponders(t *testing.T) {
+	mockNC := new(MockNatsConn)
+	mockNC.On("RequestWithContext", mock.Anything, mock.Anything, mock.Anything).
+		Return(nil, nats.ErrNoResponders)
+
+	client := NewClient(mockNC, "svc", "nid")
+	defer client.Close()
+
+	err := client.Invoke(context.Background(), "/test.Svc/Method", &nrpc.Ping{}, &nrpc.Pong{})
+	assert.Equal(t, codes.Unavailable, status.Code(err))
+}
+
+// TestUnary_DeadlineExceeded maps context.DeadlineExceeded to codes.DeadlineExceeded.
+func TestUnary_DeadlineExceeded(t *testing.T) {
+	mockNC := new(MockNatsConn)
+	mockNC.On("RequestWithContext", mock.Anything, mock.Anything, mock.Anything).
+		Return(nil, context.DeadlineExceeded)
+
+	client := NewClient(mockNC, "svc", "nid")
+	defer client.Close()
+
+	err := client.Invoke(context.Background(), "/test.Svc/Method", &nrpc.Ping{}, &nrpc.Pong{})
+	assert.Equal(t, codes.DeadlineExceeded, status.Code(err))
+}
+
+// TestUnary_NatsTimeout maps nats.ErrTimeout to codes.DeadlineExceeded.
+func TestUnary_NatsTimeout(t *testing.T) {
+	mockNC := new(MockNatsConn)
+	mockNC.On("RequestWithContext", mock.Anything, mock.Anything, mock.Anything).
+		Return(nil, nats.ErrTimeout)
+
+	client := NewClient(mockNC, "svc", "nid")
+	defer client.Close()
+
+	err := client.Invoke(context.Background(), "/test.Svc/Method", &nrpc.Ping{}, &nrpc.Pong{})
+	assert.Equal(t, codes.DeadlineExceeded, status.Code(err))
+}
+
+// TestUnary_StatusErrorPropagation verifies that a non-OK status returned in
+// the UnaryResponse is surfaced as a matching gRPC status on the client.
+func TestUnary_StatusErrorPropagation(t *testing.T) {
+	mockNC := new(MockNatsConn)
+
+	resp := &nrpc.Response{Type: &nrpc.Response_Unary{Unary: &nrpc.UnaryResponse{
+		Status: status.New(codes.PermissionDenied, "nope").Proto(),
+	}}}
+	out, err := proto.Marshal(resp)
+	assert.NoError(t, err)
+	mockNC.On("RequestWithContext", mock.Anything, mock.Anything, mock.Anything).
+		Return(&nats.Msg{Data: out}, nil)
+
+	client := NewClient(mockNC, "svc", "nid")
+	defer client.Close()
+
+	err = client.Invoke(context.Background(), "/test.Svc/Method", &nrpc.Ping{}, &nrpc.Pong{})
+	st, ok := status.FromError(err)
+	if assert.True(t, ok, "error should be a gRPC status") {
+		assert.Equal(t, codes.PermissionDenied, st.Code())
+		assert.Equal(t, "nope", st.Message())
+	}
+}
+
+// TestUnary_HeaderTrailerCallOptions verifies that grpc.Header / grpc.Trailer
+// CallOptions are populated from the unary response.
+func TestUnary_HeaderTrailerCallOptions(t *testing.T) {
+	mockNC := new(MockNatsConn)
+
+	resp := &nrpc.Response{Type: &nrpc.Response_Unary{Unary: &nrpc.UnaryResponse{
+		Status:  status.Convert(nil).Proto(),
+		Data:    mustMarshal(t, &nrpc.Pong{}),
+		Header:  &nrpc.Metadata{Md: map[string]*nrpc.Strings{"h-key": {Values: []string{"hv"}}}},
+		Trailer: &nrpc.Metadata{Md: map[string]*nrpc.Strings{"t-key": {Values: []string{"tv"}}}},
+	}}}
+	out, err := proto.Marshal(resp)
+	assert.NoError(t, err)
+	mockNC.On("RequestWithContext", mock.Anything, mock.Anything, mock.Anything).
+		Return(&nats.Msg{Data: out}, nil)
+
+	client := NewClient(mockNC, "svc", "nid")
+	defer client.Close()
+
+	var hdr, tr metadata.MD
+	err = client.Invoke(context.Background(), "/test.Svc/Method",
+		&nrpc.Ping{}, &nrpc.Pong{},
+		grpc.Header(&hdr), grpc.Trailer(&tr))
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"hv"}, hdr["h-key"])
+	assert.Equal(t, []string{"tv"}, tr["t-key"])
+}
+
+func mustMarshal(t *testing.T, m proto.Message) []byte {
+	t.Helper()
+	b, err := proto.Marshal(m)
+	assert.NoError(t, err)
+	return b
 }

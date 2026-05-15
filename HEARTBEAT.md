@@ -2,7 +2,15 @@
 
 ## Summary
 
-This document describes the heartbeat mechanism implemented for nats-grpc to detect when a server dies during streaming RPC calls.
+This document describes the heartbeat mechanism implemented for nats-grpc to detect when a server dies during a streaming RPC call.
+
+## Scope
+
+The heartbeat applies to **streaming RPCs only**. It is not used for unary RPCs and is not started on the unary code path.
+
+- **Unary RPCs** use NATS request/reply (`nc.RequestWithContext`) under the hood — a single message in, single message out (see `pkg/rpc/client.go` `Client.invoker`). Server death is observed as a `DeadlineExceeded` (the context deadline) or `Unavailable` (`nats.ErrNoResponders`). No Ping/Pong required, no per-call goroutines, and queue-group load balancing across replicas is safe.
+- **Streaming RPCs** keep the multi-message `Call / Data / End` protocol, so they need active liveness detection — that is what Ping/Pong provides.
+- Streaming requires a **non-empty `nid`** (point-to-point addressing). Streaming with an empty `nid` would queue-group-fan-out across replicas and break stream affinity; the heartbeat assumes a single peer.
 
 ## Problem Statement
 
@@ -11,10 +19,10 @@ Before this implementation, when a client makes a streaming RPC call and the ser
 ## Solution
 
 Implemented a bidirectional heartbeat protocol using Ping/Pong messages:
-- **Client sends Ping messages** every 2 seconds
-- **Server responds with Pong messages** immediately  
-- **Client monitors Pong responses** and detects failure if no Pong received within 5 seconds
-- **Detection time**: 3-6 seconds after server death
+- **Client sends Ping messages** every 5 seconds
+- **Server responds with Pong messages** immediately
+- **Client monitors Pong responses** and detects failure if no Pong received within 15 seconds
+- **Detection time**: 10-15 seconds after server death
 
 ## Changes Made
 
@@ -66,8 +74,8 @@ Added fields to `clientStream`:
 ```go
 lastPongTime  time.Time       // Time of last received Pong
 pongMu        sync.Mutex      // Protects lastPongTime
-pingInterval  time.Duration   // 2 seconds
-pongTimeout   time.Duration   // 5 seconds  
+pingInterval  time.Duration   // 5 seconds
+pongTimeout   time.Duration   // 15 seconds
 heartbeatStop chan struct{}   // Signal to stop heartbeat goroutines
 ```
 
@@ -94,9 +102,9 @@ Expected output shows client detecting server death within 3-6 seconds after the
 
 ### Heartbeat Timing
 
-- **Ping Interval**: 2 seconds
-- **Pong Timeout**: 5 seconds
-- **Detection Window**: If server dies at time T, client will detect between T+3s and T+6s
+- **Ping Interval**: 5 seconds
+- **Pong Timeout**: 15 seconds
+- **Detection Window**: If server dies at time T, client will detect between T+10s and T+15s
 
 ### Error Handling
 
@@ -113,10 +121,10 @@ When heartbeat timeout occurs:
 
 ## Benefits
 
-1. **Quick Detection**: Server death detected in 3-6 seconds (vs indefinite hang)
-2. **Automatic**: Works transparently for all streaming RPCs
-3. **Minimal Overhead**: Only 1 Ping/Pong exchange every 2 seconds
-4. **Reliable**: Works even for server-streaming where client only receives data
+1. **Bounded Detection**: Server death detected in 10-15 seconds (vs indefinite hang)
+2. **Automatic for streaming RPCs**: Works transparently for any streaming RPC
+3. **Minimal Overhead**: Only 1 Ping/Pong exchange every 5 seconds, per stream
+4. **Reliable**: Works even for server-streaming where the client only receives data
 5. **Clean Shutdown**: Proper resource cleanup on detection
 
 ## Compatibility

@@ -113,18 +113,93 @@ func (c *Client) Invoke(ctx context.Context, method string, args interface{}, re
 	return c.invoker(ctx, method, args, reply, nil, opts...)
 }
 
-// invoker is the actual RPC invocation logic
+// invoker is the actual RPC invocation logic for unary RPCs.
+//
+// Unary calls use NATS request/reply (a single message in, single message out)
+// so that queue-group load balancing across multiple server replicas is safe:
+// the entire RPC lands on exactly one replica. Streaming RPCs still go through
+// newClientStream / NewStream and remain pinned to one server (see HEARTBEAT.md).
 func (c *Client) invoker(ctx context.Context, method string, args interface{}, reply interface{}, _ *grpc.ClientConn, opts ...grpc.CallOption) error {
 	prefix := "nrpc"
 	if len(c.svcid) > 0 {
 		prefix = fmt.Sprintf("nrpc.%v", c.svcid)
 	}
 	subj := prefix + strings.ReplaceAll(method, "/", ".")
-	stream := newClientStream(ctx, c, subj, c.log, opts...)
-	c.mu.Lock()
-	c.streams[stream.reply] = stream
-	c.mu.Unlock()
-	return stream.Invoke(ctx, method, args, reply, opts...)
+
+	payload, err := proto.Marshal(args.(proto.Message))
+	if err != nil {
+		return err
+	}
+
+	req := &nrpc.Request{
+		Type: &nrpc.Request_Unary{
+			Unary: &nrpc.UnaryRequest{
+				Method: method,
+				Data:   payload,
+			},
+		},
+	}
+	if md, ok := metadata.FromOutgoingContext(ctx); ok {
+		req.GetUnary().Metadata = utils.MakeMetadata(md)
+	}
+
+	reqBytes, err := proto.Marshal(req)
+	if err != nil {
+		return err
+	}
+
+	// Honor ctx deadline; nc.RequestWithContext returns nats.ErrTimeout when
+	// the deadline fires, which we map to gRPC DeadlineExceeded.
+	msg, err := c.nc.RequestWithContext(ctx, subj, reqBytes)
+	if err != nil {
+		switch err {
+		case context.DeadlineExceeded, nats.ErrTimeout:
+			return status.Error(codes.DeadlineExceeded, "deadline exceeded")
+		case context.Canceled:
+			return status.Error(codes.Canceled, "context canceled")
+		case nats.ErrNoResponders:
+			return status.Error(codes.Unavailable, "no responders")
+		}
+		return status.Error(codes.Unavailable, err.Error())
+	}
+
+	resp := &nrpc.Response{}
+	if err := proto.Unmarshal(msg.Data, resp); err != nil {
+		return err
+	}
+	u := resp.GetUnary()
+	if u == nil {
+		return status.Error(codes.Internal, "expected unary response")
+	}
+
+	// Populate optional header/trailer call options.
+	for _, o := range opts {
+		switch o := o.(type) {
+		case grpc.HeaderCallOption:
+			if u.Header != nil && o.HeaderAddr != nil {
+				if *o.HeaderAddr == nil {
+					*o.HeaderAddr = metadata.MD{}
+				}
+				for hdr, data := range u.Header.Md {
+					o.HeaderAddr.Append(hdr, data.Values...)
+				}
+			}
+		case grpc.TrailerCallOption:
+			if u.Trailer != nil && o.TrailerAddr != nil {
+				if *o.TrailerAddr == nil {
+					*o.TrailerAddr = metadata.MD{}
+				}
+				for hdr, data := range u.Trailer.Md {
+					o.TrailerAddr.Append(hdr, data.Values...)
+				}
+			}
+		}
+	}
+
+	if u.Status != nil && u.Status.Code != int32(codes.OK) {
+		return status.ErrorProto(u.Status)
+	}
+	return proto.Unmarshal(u.Data, reply.(proto.Message))
 }
 
 //NewStream begins a streaming RPC.

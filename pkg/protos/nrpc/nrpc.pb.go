@@ -30,6 +30,7 @@ type Request struct {
 	//	*Request_Data
 	//	*Request_End
 	//	*Request_Ping
+	//	*Request_Unary
 	Type          isRequest_Type `protobuf_oneof:"type"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -108,6 +109,15 @@ func (x *Request) GetPing() *Ping {
 	return nil
 }
 
+func (x *Request) GetUnary() *UnaryRequest {
+	if x != nil {
+		if x, ok := x.Type.(*Request_Unary); ok {
+			return x.Unary
+		}
+	}
+	return nil
+}
+
 type isRequest_Type interface {
 	isRequest_Type()
 }
@@ -128,6 +138,10 @@ type Request_Ping struct {
 	Ping *Ping `protobuf:"bytes,5,opt,name=ping,proto3,oneof"`
 }
 
+type Request_Unary struct {
+	Unary *UnaryRequest `protobuf:"bytes,6,opt,name=unary,proto3,oneof"`
+}
+
 func (*Request_Call) isRequest_Type() {}
 
 func (*Request_Data) isRequest_Type() {}
@@ -135,6 +149,8 @@ func (*Request_Data) isRequest_Type() {}
 func (*Request_End) isRequest_Type() {}
 
 func (*Request_Ping) isRequest_Type() {}
+
+func (*Request_Unary) isRequest_Type() {}
 
 type Response struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -144,6 +160,7 @@ type Response struct {
 	//	*Response_Data
 	//	*Response_End
 	//	*Response_Pong
+	//	*Response_Unary
 	Type          isResponse_Type `protobuf_oneof:"type"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -222,6 +239,15 @@ func (x *Response) GetPong() *Pong {
 	return nil
 }
 
+func (x *Response) GetUnary() *UnaryResponse {
+	if x != nil {
+		if x, ok := x.Type.(*Response_Unary); ok {
+			return x.Unary
+		}
+	}
+	return nil
+}
+
 type isResponse_Type interface {
 	isResponse_Type()
 }
@@ -242,6 +268,10 @@ type Response_Pong struct {
 	Pong *Pong `protobuf:"bytes,5,opt,name=pong,proto3,oneof"`
 }
 
+type Response_Unary struct {
+	Unary *UnaryResponse `protobuf:"bytes,6,opt,name=unary,proto3,oneof"`
+}
+
 func (*Response_Begin) isResponse_Type() {}
 
 func (*Response_Data) isResponse_Type() {}
@@ -249,6 +279,139 @@ func (*Response_Data) isResponse_Type() {}
 func (*Response_End) isResponse_Type() {}
 
 func (*Response_Pong) isResponse_Type() {}
+
+func (*Response_Unary) isResponse_Type() {}
+
+// UnaryRequest bundles Call + Data into a single message so unary RPCs can be
+// served via NATS request/reply (queue-group load-balanced).
+type UnaryRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Method        string                 `protobuf:"bytes,1,opt,name=method,proto3" json:"method,omitempty"`
+	Metadata      *Metadata              `protobuf:"bytes,2,opt,name=metadata,proto3" json:"metadata,omitempty"`
+	Data          []byte                 `protobuf:"bytes,3,opt,name=data,proto3" json:"data,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *UnaryRequest) Reset() {
+	*x = UnaryRequest{}
+	mi := &file_nrpc_nrpc_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *UnaryRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*UnaryRequest) ProtoMessage() {}
+
+func (x *UnaryRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_nrpc_nrpc_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use UnaryRequest.ProtoReflect.Descriptor instead.
+func (*UnaryRequest) Descriptor() ([]byte, []int) {
+	return file_nrpc_nrpc_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *UnaryRequest) GetMethod() string {
+	if x != nil {
+		return x.Method
+	}
+	return ""
+}
+
+func (x *UnaryRequest) GetMetadata() *Metadata {
+	if x != nil {
+		return x.Metadata
+	}
+	return nil
+}
+
+func (x *UnaryRequest) GetData() []byte {
+	if x != nil {
+		return x.Data
+	}
+	return nil
+}
+
+// UnaryResponse carries the full reply for a unary RPC in one message.
+type UnaryResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Header        *Metadata              `protobuf:"bytes,1,opt,name=header,proto3" json:"header,omitempty"`
+	Trailer       *Metadata              `protobuf:"bytes,2,opt,name=trailer,proto3" json:"trailer,omitempty"`
+	Status        *status.Status         `protobuf:"bytes,3,opt,name=status,proto3" json:"status,omitempty"`
+	Data          []byte                 `protobuf:"bytes,4,opt,name=data,proto3" json:"data,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *UnaryResponse) Reset() {
+	*x = UnaryResponse{}
+	mi := &file_nrpc_nrpc_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *UnaryResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*UnaryResponse) ProtoMessage() {}
+
+func (x *UnaryResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_nrpc_nrpc_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use UnaryResponse.ProtoReflect.Descriptor instead.
+func (*UnaryResponse) Descriptor() ([]byte, []int) {
+	return file_nrpc_nrpc_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *UnaryResponse) GetHeader() *Metadata {
+	if x != nil {
+		return x.Header
+	}
+	return nil
+}
+
+func (x *UnaryResponse) GetTrailer() *Metadata {
+	if x != nil {
+		return x.Trailer
+	}
+	return nil
+}
+
+func (x *UnaryResponse) GetStatus() *status.Status {
+	if x != nil {
+		return x.Status
+	}
+	return nil
+}
+
+func (x *UnaryResponse) GetData() []byte {
+	if x != nil {
+		return x.Data
+	}
+	return nil
+}
 
 type Strings struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
@@ -259,7 +422,7 @@ type Strings struct {
 
 func (x *Strings) Reset() {
 	*x = Strings{}
-	mi := &file_nrpc_nrpc_proto_msgTypes[2]
+	mi := &file_nrpc_nrpc_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -271,7 +434,7 @@ func (x *Strings) String() string {
 func (*Strings) ProtoMessage() {}
 
 func (x *Strings) ProtoReflect() protoreflect.Message {
-	mi := &file_nrpc_nrpc_proto_msgTypes[2]
+	mi := &file_nrpc_nrpc_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -284,7 +447,7 @@ func (x *Strings) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Strings.ProtoReflect.Descriptor instead.
 func (*Strings) Descriptor() ([]byte, []int) {
-	return file_nrpc_nrpc_proto_rawDescGZIP(), []int{2}
+	return file_nrpc_nrpc_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *Strings) GetValues() []string {
@@ -303,7 +466,7 @@ type Metadata struct {
 
 func (x *Metadata) Reset() {
 	*x = Metadata{}
-	mi := &file_nrpc_nrpc_proto_msgTypes[3]
+	mi := &file_nrpc_nrpc_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -315,7 +478,7 @@ func (x *Metadata) String() string {
 func (*Metadata) ProtoMessage() {}
 
 func (x *Metadata) ProtoReflect() protoreflect.Message {
-	mi := &file_nrpc_nrpc_proto_msgTypes[3]
+	mi := &file_nrpc_nrpc_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -328,7 +491,7 @@ func (x *Metadata) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Metadata.ProtoReflect.Descriptor instead.
 func (*Metadata) Descriptor() ([]byte, []int) {
-	return file_nrpc_nrpc_proto_rawDescGZIP(), []int{3}
+	return file_nrpc_nrpc_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *Metadata) GetMd() map[string]*Strings {
@@ -349,7 +512,7 @@ type Call struct {
 
 func (x *Call) Reset() {
 	*x = Call{}
-	mi := &file_nrpc_nrpc_proto_msgTypes[4]
+	mi := &file_nrpc_nrpc_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -361,7 +524,7 @@ func (x *Call) String() string {
 func (*Call) ProtoMessage() {}
 
 func (x *Call) ProtoReflect() protoreflect.Message {
-	mi := &file_nrpc_nrpc_proto_msgTypes[4]
+	mi := &file_nrpc_nrpc_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -374,7 +537,7 @@ func (x *Call) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Call.ProtoReflect.Descriptor instead.
 func (*Call) Descriptor() ([]byte, []int) {
-	return file_nrpc_nrpc_proto_rawDescGZIP(), []int{4}
+	return file_nrpc_nrpc_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *Call) GetMethod() string {
@@ -408,7 +571,7 @@ type Begin struct {
 
 func (x *Begin) Reset() {
 	*x = Begin{}
-	mi := &file_nrpc_nrpc_proto_msgTypes[5]
+	mi := &file_nrpc_nrpc_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -420,7 +583,7 @@ func (x *Begin) String() string {
 func (*Begin) ProtoMessage() {}
 
 func (x *Begin) ProtoReflect() protoreflect.Message {
-	mi := &file_nrpc_nrpc_proto_msgTypes[5]
+	mi := &file_nrpc_nrpc_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -433,7 +596,7 @@ func (x *Begin) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Begin.ProtoReflect.Descriptor instead.
 func (*Begin) Descriptor() ([]byte, []int) {
-	return file_nrpc_nrpc_proto_rawDescGZIP(), []int{5}
+	return file_nrpc_nrpc_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *Begin) GetHeader() *Metadata {
@@ -459,7 +622,7 @@ type Data struct {
 
 func (x *Data) Reset() {
 	*x = Data{}
-	mi := &file_nrpc_nrpc_proto_msgTypes[6]
+	mi := &file_nrpc_nrpc_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -471,7 +634,7 @@ func (x *Data) String() string {
 func (*Data) ProtoMessage() {}
 
 func (x *Data) ProtoReflect() protoreflect.Message {
-	mi := &file_nrpc_nrpc_proto_msgTypes[6]
+	mi := &file_nrpc_nrpc_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -484,7 +647,7 @@ func (x *Data) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Data.ProtoReflect.Descriptor instead.
 func (*Data) Descriptor() ([]byte, []int) {
-	return file_nrpc_nrpc_proto_rawDescGZIP(), []int{6}
+	return file_nrpc_nrpc_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *Data) GetData() []byte {
@@ -504,7 +667,7 @@ type End struct {
 
 func (x *End) Reset() {
 	*x = End{}
-	mi := &file_nrpc_nrpc_proto_msgTypes[7]
+	mi := &file_nrpc_nrpc_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -516,7 +679,7 @@ func (x *End) String() string {
 func (*End) ProtoMessage() {}
 
 func (x *End) ProtoReflect() protoreflect.Message {
-	mi := &file_nrpc_nrpc_proto_msgTypes[7]
+	mi := &file_nrpc_nrpc_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -529,7 +692,7 @@ func (x *End) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use End.ProtoReflect.Descriptor instead.
 func (*End) Descriptor() ([]byte, []int) {
-	return file_nrpc_nrpc_proto_rawDescGZIP(), []int{7}
+	return file_nrpc_nrpc_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *End) GetStatus() *status.Status {
@@ -555,7 +718,7 @@ type Ping struct {
 
 func (x *Ping) Reset() {
 	*x = Ping{}
-	mi := &file_nrpc_nrpc_proto_msgTypes[8]
+	mi := &file_nrpc_nrpc_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -567,7 +730,7 @@ func (x *Ping) String() string {
 func (*Ping) ProtoMessage() {}
 
 func (x *Ping) ProtoReflect() protoreflect.Message {
-	mi := &file_nrpc_nrpc_proto_msgTypes[8]
+	mi := &file_nrpc_nrpc_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -580,7 +743,7 @@ func (x *Ping) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Ping.ProtoReflect.Descriptor instead.
 func (*Ping) Descriptor() ([]byte, []int) {
-	return file_nrpc_nrpc_proto_rawDescGZIP(), []int{8}
+	return file_nrpc_nrpc_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *Ping) GetTimestamp() int64 {
@@ -599,7 +762,7 @@ type Pong struct {
 
 func (x *Pong) Reset() {
 	*x = Pong{}
-	mi := &file_nrpc_nrpc_proto_msgTypes[9]
+	mi := &file_nrpc_nrpc_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -611,7 +774,7 @@ func (x *Pong) String() string {
 func (*Pong) ProtoMessage() {}
 
 func (x *Pong) ProtoReflect() protoreflect.Message {
-	mi := &file_nrpc_nrpc_proto_msgTypes[9]
+	mi := &file_nrpc_nrpc_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -624,7 +787,7 @@ func (x *Pong) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Pong.ProtoReflect.Descriptor instead.
 func (*Pong) Descriptor() ([]byte, []int) {
-	return file_nrpc_nrpc_proto_rawDescGZIP(), []int{9}
+	return file_nrpc_nrpc_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *Pong) GetTimestamp() int64 {
@@ -638,7 +801,7 @@ var File_nrpc_nrpc_proto protoreflect.FileDescriptor
 
 const file_nrpc_nrpc_proto_rawDesc = "" +
 	"\n" +
-	"\x0fnrpc/nrpc.proto\x12\x04nrpc\x1a\x17google/rpc/status.proto\"\x96\x01\n" +
+	"\x0fnrpc/nrpc.proto\x12\x04nrpc\x1a\x17google/rpc/status.proto\"\xc2\x01\n" +
 	"\aRequest\x12 \n" +
 	"\x04call\x18\x02 \x01(\v2\n" +
 	".nrpc.CallH\x00R\x04call\x12 \n" +
@@ -646,16 +809,27 @@ const file_nrpc_nrpc_proto_rawDesc = "" +
 	".nrpc.DataH\x00R\x04data\x12\x1d\n" +
 	"\x03end\x18\x04 \x01(\v2\t.nrpc.EndH\x00R\x03end\x12 \n" +
 	"\x04ping\x18\x05 \x01(\v2\n" +
-	".nrpc.PingH\x00R\x04pingB\x06\n" +
-	"\x04type\"\x9a\x01\n" +
+	".nrpc.PingH\x00R\x04ping\x12*\n" +
+	"\x05unary\x18\x06 \x01(\v2\x12.nrpc.UnaryRequestH\x00R\x05unaryB\x06\n" +
+	"\x04type\"\xc7\x01\n" +
 	"\bResponse\x12#\n" +
 	"\x05begin\x18\x02 \x01(\v2\v.nrpc.BeginH\x00R\x05begin\x12 \n" +
 	"\x04data\x18\x03 \x01(\v2\n" +
 	".nrpc.DataH\x00R\x04data\x12\x1d\n" +
 	"\x03end\x18\x04 \x01(\v2\t.nrpc.EndH\x00R\x03end\x12 \n" +
 	"\x04pong\x18\x05 \x01(\v2\n" +
-	".nrpc.PongH\x00R\x04pongB\x06\n" +
-	"\x04type\"!\n" +
+	".nrpc.PongH\x00R\x04pong\x12+\n" +
+	"\x05unary\x18\x06 \x01(\v2\x13.nrpc.UnaryResponseH\x00R\x05unaryB\x06\n" +
+	"\x04type\"f\n" +
+	"\fUnaryRequest\x12\x16\n" +
+	"\x06method\x18\x01 \x01(\tR\x06method\x12*\n" +
+	"\bmetadata\x18\x02 \x01(\v2\x0e.nrpc.MetadataR\bmetadata\x12\x12\n" +
+	"\x04data\x18\x03 \x01(\fR\x04data\"\xa1\x01\n" +
+	"\rUnaryResponse\x12&\n" +
+	"\x06header\x18\x01 \x01(\v2\x0e.nrpc.MetadataR\x06header\x12(\n" +
+	"\atrailer\x18\x02 \x01(\v2\x0e.nrpc.MetadataR\atrailer\x12*\n" +
+	"\x06status\x18\x03 \x01(\v2\x12.google.rpc.StatusR\x06status\x12\x12\n" +
+	"\x04data\x18\x04 \x01(\fR\x04data\"!\n" +
 	"\aStrings\x12\x16\n" +
 	"\x06values\x18\x01 \x03(\tR\x06values\"x\n" +
 	"\bMetadata\x12&\n" +
@@ -692,41 +866,49 @@ func file_nrpc_nrpc_proto_rawDescGZIP() []byte {
 	return file_nrpc_nrpc_proto_rawDescData
 }
 
-var file_nrpc_nrpc_proto_msgTypes = make([]protoimpl.MessageInfo, 11)
+var file_nrpc_nrpc_proto_msgTypes = make([]protoimpl.MessageInfo, 13)
 var file_nrpc_nrpc_proto_goTypes = []any{
 	(*Request)(nil),       // 0: nrpc.Request
 	(*Response)(nil),      // 1: nrpc.Response
-	(*Strings)(nil),       // 2: nrpc.Strings
-	(*Metadata)(nil),      // 3: nrpc.Metadata
-	(*Call)(nil),          // 4: nrpc.Call
-	(*Begin)(nil),         // 5: nrpc.Begin
-	(*Data)(nil),          // 6: nrpc.Data
-	(*End)(nil),           // 7: nrpc.End
-	(*Ping)(nil),          // 8: nrpc.Ping
-	(*Pong)(nil),          // 9: nrpc.Pong
-	nil,                   // 10: nrpc.Metadata.MdEntry
-	(*status.Status)(nil), // 11: google.rpc.Status
+	(*UnaryRequest)(nil),  // 2: nrpc.UnaryRequest
+	(*UnaryResponse)(nil), // 3: nrpc.UnaryResponse
+	(*Strings)(nil),       // 4: nrpc.Strings
+	(*Metadata)(nil),      // 5: nrpc.Metadata
+	(*Call)(nil),          // 6: nrpc.Call
+	(*Begin)(nil),         // 7: nrpc.Begin
+	(*Data)(nil),          // 8: nrpc.Data
+	(*End)(nil),           // 9: nrpc.End
+	(*Ping)(nil),          // 10: nrpc.Ping
+	(*Pong)(nil),          // 11: nrpc.Pong
+	nil,                   // 12: nrpc.Metadata.MdEntry
+	(*status.Status)(nil), // 13: google.rpc.Status
 }
 var file_nrpc_nrpc_proto_depIdxs = []int32{
-	4,  // 0: nrpc.Request.call:type_name -> nrpc.Call
-	6,  // 1: nrpc.Request.data:type_name -> nrpc.Data
-	7,  // 2: nrpc.Request.end:type_name -> nrpc.End
-	8,  // 3: nrpc.Request.ping:type_name -> nrpc.Ping
-	5,  // 4: nrpc.Response.begin:type_name -> nrpc.Begin
-	6,  // 5: nrpc.Response.data:type_name -> nrpc.Data
-	7,  // 6: nrpc.Response.end:type_name -> nrpc.End
-	9,  // 7: nrpc.Response.pong:type_name -> nrpc.Pong
-	10, // 8: nrpc.Metadata.md:type_name -> nrpc.Metadata.MdEntry
-	3,  // 9: nrpc.Call.metadata:type_name -> nrpc.Metadata
-	3,  // 10: nrpc.Begin.header:type_name -> nrpc.Metadata
-	11, // 11: nrpc.End.status:type_name -> google.rpc.Status
-	3,  // 12: nrpc.End.trailer:type_name -> nrpc.Metadata
-	2,  // 13: nrpc.Metadata.MdEntry.value:type_name -> nrpc.Strings
-	14, // [14:14] is the sub-list for method output_type
-	14, // [14:14] is the sub-list for method input_type
-	14, // [14:14] is the sub-list for extension type_name
-	14, // [14:14] is the sub-list for extension extendee
-	0,  // [0:14] is the sub-list for field type_name
+	6,  // 0: nrpc.Request.call:type_name -> nrpc.Call
+	8,  // 1: nrpc.Request.data:type_name -> nrpc.Data
+	9,  // 2: nrpc.Request.end:type_name -> nrpc.End
+	10, // 3: nrpc.Request.ping:type_name -> nrpc.Ping
+	2,  // 4: nrpc.Request.unary:type_name -> nrpc.UnaryRequest
+	7,  // 5: nrpc.Response.begin:type_name -> nrpc.Begin
+	8,  // 6: nrpc.Response.data:type_name -> nrpc.Data
+	9,  // 7: nrpc.Response.end:type_name -> nrpc.End
+	11, // 8: nrpc.Response.pong:type_name -> nrpc.Pong
+	3,  // 9: nrpc.Response.unary:type_name -> nrpc.UnaryResponse
+	5,  // 10: nrpc.UnaryRequest.metadata:type_name -> nrpc.Metadata
+	5,  // 11: nrpc.UnaryResponse.header:type_name -> nrpc.Metadata
+	5,  // 12: nrpc.UnaryResponse.trailer:type_name -> nrpc.Metadata
+	13, // 13: nrpc.UnaryResponse.status:type_name -> google.rpc.Status
+	12, // 14: nrpc.Metadata.md:type_name -> nrpc.Metadata.MdEntry
+	5,  // 15: nrpc.Call.metadata:type_name -> nrpc.Metadata
+	5,  // 16: nrpc.Begin.header:type_name -> nrpc.Metadata
+	13, // 17: nrpc.End.status:type_name -> google.rpc.Status
+	5,  // 18: nrpc.End.trailer:type_name -> nrpc.Metadata
+	4,  // 19: nrpc.Metadata.MdEntry.value:type_name -> nrpc.Strings
+	20, // [20:20] is the sub-list for method output_type
+	20, // [20:20] is the sub-list for method input_type
+	20, // [20:20] is the sub-list for extension type_name
+	20, // [20:20] is the sub-list for extension extendee
+	0,  // [0:20] is the sub-list for field type_name
 }
 
 func init() { file_nrpc_nrpc_proto_init() }
@@ -739,12 +921,14 @@ func file_nrpc_nrpc_proto_init() {
 		(*Request_Data)(nil),
 		(*Request_End)(nil),
 		(*Request_Ping)(nil),
+		(*Request_Unary)(nil),
 	}
 	file_nrpc_nrpc_proto_msgTypes[1].OneofWrappers = []any{
 		(*Response_Begin)(nil),
 		(*Response_Data)(nil),
 		(*Response_End)(nil),
 		(*Response_Pong)(nil),
+		(*Response_Unary)(nil),
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
@@ -752,7 +936,7 @@ func file_nrpc_nrpc_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_nrpc_nrpc_proto_rawDesc), len(file_nrpc_nrpc_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   11,
+			NumMessages:   13,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

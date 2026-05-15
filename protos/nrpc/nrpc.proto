@@ -12,6 +12,7 @@ message Request {
 		Data data = 3;
 		End end = 4;
 		Ping ping = 5;
+		UnaryRequest unary = 6;
 	}
 }
 
@@ -21,7 +22,24 @@ message Response {
 		Data data = 3;
 		End end = 4;
 		Pong pong = 5;
+		UnaryResponse unary = 6;
 	}
+}
+
+// UnaryRequest bundles Call + Data into a single message so unary RPCs can be
+// served via NATS request/reply (queue-group load-balanced).
+message UnaryRequest {
+	string method = 1;
+	Metadata metadata = 2;
+	bytes data = 3;
+}
+
+// UnaryResponse carries the full reply for a unary RPC in one message.
+message UnaryResponse {
+	Metadata header = 1;
+	Metadata trailer = 2;
+	google.rpc.Status status = 3;
+	bytes data = 4;
 }
 
 message Strings {

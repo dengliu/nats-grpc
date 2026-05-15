@@ -22,6 +22,10 @@ import (
 // redefine grpc.serverMethodHandler as it is not exposed
 type serverMethodHandler func(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error)
 
+// unaryHandler dispatches a single UnaryRequest message and writes the reply
+// to msg.Reply. Used for queue-group load-balanced unary RPCs.
+type unaryHandler func(srv *Server, msg *nats.Msg, req *nrpc.UnaryRequest)
+
 type serverTransportStream struct {
 	stream *serverStream
 }
@@ -63,6 +67,56 @@ func serverUnaryHandler(srv interface{}, handler serverMethodHandler) handlerFun
 	}
 }
 
+// serverUnaryRequestHandler builds a single-shot handler used by the unary
+// queue subscription. The request is delivered as a UnaryRequest and the reply
+// is written back to msg.Reply via msg.Respond — no per-call subscription or
+// stream state is created on either side.
+func serverUnaryRequestHandler(srv interface{}, handler serverMethodHandler) unaryHandler {
+	return func(s *Server, msg *nats.Msg, ureq *nrpc.UnaryRequest) {
+		interceptor := s.unaryInt
+
+		ctx := context.Background()
+		if ureq.Metadata != nil {
+			md := make(metadata.MD)
+			for hdr, data := range ureq.Metadata.Md {
+				md[hdr] = data.Values
+			}
+			ctx = metadata.NewIncomingContext(ctx, md)
+		}
+
+		// dec is called by the generated gRPC handler once to unmarshal the
+		// request body. We have the bytes already; this just decodes them.
+		dec := func(in interface{}) error {
+			return proto.Unmarshal(ureq.Data, in.(proto.Message))
+		}
+
+		response, err := handler(srv, ctx, dec, interceptor)
+
+		resp := &nrpc.Response{Type: &nrpc.Response_Unary{Unary: &nrpc.UnaryResponse{}}}
+		u := resp.GetUnary()
+		if err != nil {
+			u.Status = status.Convert(err).Proto()
+		} else {
+			payload, marshalErr := proto.Marshal(response.(proto.Message))
+			if marshalErr != nil {
+				u.Status = status.Convert(marshalErr).Proto()
+			} else {
+				u.Data = payload
+				u.Status = status.Convert(nil).Proto()
+			}
+		}
+
+		out, err := proto.Marshal(resp)
+		if err != nil {
+			s.log.Errorf("marshal unary response: %v", err)
+			return
+		}
+		if err := msg.Respond(out); err != nil {
+			s.log.Errorf("respond unary: %v", err)
+		}
+	}
+}
+
 func serverStreamHandler(srv interface{}, handler grpc.StreamHandler) handlerFunc {
 	return func(s *serverStream) {
 		// If stream interceptor is set, use it
@@ -100,18 +154,19 @@ type serviceInfo struct {
 
 // Server is the interface to gRPC over NATS
 type Server struct {
-	nc        NatsConn
-	ctx       context.Context
-	cancel    context.CancelFunc
-	log       *logrus.Logger
-	handlers  map[string]handlerFunc
-	streams   map[string]*serverStream
-	mu        sync.Mutex
-	subs      map[string]*nats.Subscription
-	nid       string
-	services  map[string]*serviceInfo // service name -> service info
-	unaryInt  grpc.UnaryServerInterceptor
-	streamInt grpc.StreamServerInterceptor
+	nc            NatsConn
+	ctx           context.Context
+	cancel        context.CancelFunc
+	log           *logrus.Logger
+	handlers      map[string]handlerFunc
+	unaryHandlers map[string]unaryHandler // method -> unary fast-path handler
+	streams       map[string]*serverStream
+	mu            sync.Mutex
+	subs          map[string]*nats.Subscription
+	nid           string
+	services      map[string]*serviceInfo // service name -> service info
+	unaryInt      grpc.UnaryServerInterceptor
+	streamInt     grpc.StreamServerInterceptor
 }
 
 // NewServer creates a new Proxy
@@ -139,13 +194,14 @@ func WithStreamServerInterceptor(interceptor grpc.StreamServerInterceptor) Serve
 // NewServerWithOptions creates a new Server with options
 func NewServerWithOptions(nc NatsConn, nid string, opts ...ServerOption) *Server {
 	s := &Server{
-		nc:       nc,
-		handlers: make(map[string]handlerFunc),
-		streams:  make(map[string]*serverStream),
-		subs:     make(map[string]*nats.Subscription),
-		services: make(map[string]*serviceInfo),
-		log:      log.NewLoggerWithFields(log.DebugLevel, "nats-grpc.Server", log.Fields{"self-nid": nid}),
-		nid:      nid,
+		nc:            nc,
+		handlers:      make(map[string]handlerFunc),
+		unaryHandlers: make(map[string]unaryHandler),
+		streams:       make(map[string]*serverStream),
+		subs:          make(map[string]*nats.Subscription),
+		services:      make(map[string]*serviceInfo),
+		log:           log.NewLoggerWithFields(log.DebugLevel, "nats-grpc.Server", log.Fields{"self-nid": nid}),
+		nid:           nid,
 	}
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 	
@@ -195,6 +251,7 @@ func (s *Server) RegisterService(sd *grpc.ServiceDesc, ss interface{}) {
 		desc := it
 		path := fmt.Sprintf("%v.%v", prefix, desc.MethodName)
 		s.handlers[path] = serverUnaryHandler(ss, serverMethodHandler(desc.Handler))
+		s.unaryHandlers[path] = serverUnaryRequestHandler(ss, serverMethodHandler(desc.Handler))
 		s.log.Infof("RegisterService: method path => %v", path)
 	}
 	for _, it := range sd.Streams {
@@ -259,10 +316,22 @@ func (s *Server) GetServiceInfo() map[string]grpc.ServiceInfo {
 }
 
 func (s *Server) onMessage(msg *nats.Msg) {
-	//p.log.Infof("Proxy.onMessage: subject %v, replay %v, data %v", msg.Subject, msg.Reply, string(msg.Data))
 	method := msg.Subject
-	log := s.log.WithField("method", method)
 
+	// Peek at the request to see if this is a single-shot unary RPC.
+	// Unary requests bypass the streaming machinery entirely so queue-group
+	// load balancing across replicas is safe (the whole RPC is one message).
+	request := &nrpc.Request{}
+	if err := proto.Unmarshal(msg.Data, request); err == nil {
+		if ureq, ok := request.Type.(*nrpc.Request_Unary); ok {
+			if h, ok := s.unaryHandlers[method]; ok {
+				go h(s, msg, ureq.Unary)
+				return
+			}
+		}
+	}
+
+	log := s.log.WithField("method", method)
 	s.mu.Lock()
 	stream, ok := s.streams[msg.Reply]
 	if !ok {
@@ -270,6 +339,8 @@ func (s *Server) onMessage(msg *nats.Msg) {
 		s.streams[msg.Reply] = stream
 	}
 	s.mu.Unlock()
+	// Already-unmarshaled request is re-parsed inside stream.onMessage to keep
+	// that code path unchanged; the extra Unmarshal cost only hits streaming.
 	go stream.onMessage(msg)
 }
 
