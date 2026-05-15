@@ -13,18 +13,23 @@ nats:
 # Server configuration
 server:
   enabled: true
-  replicaCount: 10
-  serverCount: 100  # Number of servers per pod
+  replicaCount: 100
+  serverCount: 1000  # Number of servers per pod
+  # Number of NATS connections per pod, shared across all server goroutines
+  # via stripe assignment. NATS is goroutine-safe and multiplexes any number
+  # of subscriptions per conn; keeping this small avoids overwhelming the
+  # NATS cluster's connection table.
+  natsConnections: 4
   payloadSize: 4096
   metricsPort: 9090
 
   resources:
     limits:
-      cpu: "8"
-      memory: 32Gi
+      cpu: "4"
+      memory: 16Gi
     requests:
-      cpu: "8"
-      memory: 32Gi
+      cpu: "4"
+      memory: 16Gi
 
   service:
     type: ClusterIP
@@ -33,19 +38,23 @@ server:
 # Client configuration
 client:
   enabled: true
-  replicaCount: 10
-  clientCount: 100  # Number of clients per pod
+  replicaCount: 100
+  clientCount: 1000  # Number of clients per pod
+  # Number of NATS connections per pod, shared across all client goroutines
+  # via stripe assignment. A single nats.Conn multiplexes thousands of
+  # in-flight nc.RequestWithContext calls via its shared inbox subscription.
+  natsConnections: 4
   payloadSize: 4096
   metricsPort: 9091
   requestTimeout: 30  # gRPC request timeout in seconds
 
   resources:
     limits:
-      cpu: "8"
-      memory: 32Gi
+      cpu: "4"
+      memory: 16Gi
     requests:
-      cpu: "8"
-      memory: 32Gi
+      cpu: "4"
+      memory: 16Gi
 
   service:
     type: ClusterIP

@@ -63,18 +63,11 @@ func init() {
 	prometheus.MustRegister(activeClients)
 }
 
-func runClient(clientID, serverID string, requestPayload []byte, natsURL string, requestTimeout time.Duration, otelHandler stats.Handler) {
+// runClient sends 1 RPS to its assigned server over a NATS connection it does
+// NOT own. The conn is provided by main() from a pod-wide pool so that 1k+
+// client goroutines per pod don't each open their own TCP socket to NATS.
+func runClient(clientID, serverID string, nc *nats.Conn, requestPayload []byte, requestTimeout time.Duration, otelHandler stats.Handler) {
 	defer activeClients.Dec()
-
-	opts := []nats.Option{nats.Name(fmt.Sprintf("nats-grpc benchmark client %s", clientID))}
-	opts = rpc.SetupConnOptions(opts)
-
-	nc, err := nats.Connect(natsURL, opts...)
-	if err != nil {
-		log.Errorf("Client %s: failed to connect to NATS: %v", clientID, err)
-		return
-	}
-	defer nc.Close()
 
 	// Timeout enforcement stays as an interceptor. Metrics + tracing are
 	// driven by the otelgrpc stats handler, which receives Begin/End from
@@ -103,6 +96,29 @@ func runClient(clientID, serverID string, requestPayload []byte, natsURL string,
 	}
 }
 
+// dialNATSPool opens n NATS connections to be shared across all client
+// goroutines on this pod. nats.Conn is goroutine-safe and multiplexes any
+// number of in-flight nc.RequestWithContext calls onto its single TCP socket,
+// demuxing replies via a shared per-conn inbox subscription. Sharing keeps
+// the NATS cluster's connection count proportional to pods, not clients.
+func dialNATSPool(natsURL string, n int, namePrefix string) ([]*nats.Conn, error) {
+	conns := make([]*nats.Conn, 0, n)
+	for i := 0; i < n; i++ {
+		opts := []nats.Option{nats.Name(fmt.Sprintf("%s-%d", namePrefix, i))}
+		opts = rpc.SetupConnOptions(opts)
+		nc, err := nats.Connect(natsURL, opts...)
+		if err != nil {
+			// Close any we did open before failing.
+			for _, c := range conns {
+				c.Close()
+			}
+			return nil, fmt.Errorf("conn %d: %w", i, err)
+		}
+		conns = append(conns, nc)
+	}
+	return conns, nil
+}
+
 // setupOTelMetrics wires an OpenTelemetry MeterProvider whose metrics are
 // scraped through the existing Prometheus `/metrics` endpoint. The returned
 // MeterProvider is passed to otelgrpc; Shutdown should be called at exit.
@@ -129,13 +145,18 @@ func setupOTelMetrics(serviceName string) (*sdkmetric.MeterProvider, error) {
 
 func main() {
 	var (
-		natsURL        = flag.String("nats-url", nats.DefaultURL, "NATS server URL")
-		clientCount    = flag.Int("client-count", 1000, "Number of clients to spawn")
-		payloadBytes   = flag.Int("payload-size", 4096, "Payload size in bytes")
-		metricsPort    = flag.Int("metrics-port", 9091, "Prometheus metrics port")
-		requestTimeout = flag.Int("request-timeout", 5, "gRPC request timeout in seconds")
+		natsURL         = flag.String("nats-url", nats.DefaultURL, "NATS server URL")
+		clientCount     = flag.Int("client-count", 1000, "Number of clients to spawn")
+		natsConnections = flag.Int("nats-connections", 4, "Number of shared NATS connections per pod (stripe-assigned to clients)")
+		payloadBytes    = flag.Int("payload-size", 4096, "Payload size in bytes")
+		metricsPort     = flag.Int("metrics-port", 9091, "Prometheus metrics port")
+		requestTimeout  = flag.Int("request-timeout", 5, "gRPC request timeout in seconds")
 	)
 	flag.Parse()
+	if *natsConnections < 1 {
+		log.Errorf("--nats-connections must be >= 1")
+		os.Exit(1)
+	}
 
 	mp, err := setupOTelMetrics("nats-grpc-benchmark-client")
 	if err != nil {
@@ -160,6 +181,25 @@ func main() {
 		requestPayload[i] = byte(i % 256)
 	}
 
+	// Dial the shared NATS connection pool once per pod. All client goroutines
+	// stripe-share these conns, so the NATS cluster sees O(pods * N) connections
+	// instead of O(clients).
+	podName := os.Getenv("POD_NAME")
+	if podName == "" {
+		podName = "client"
+	}
+	conns, err := dialNATSPool(*natsURL, *natsConnections, "nats-grpc-bench-"+podName)
+	if err != nil {
+		log.Errorf("dial NATS pool: %v", err)
+		os.Exit(1)
+	}
+	defer func() {
+		for _, c := range conns {
+			c.Close()
+		}
+	}()
+	log.Infof("Opened %d shared NATS connection(s)", len(conns))
+
 	offset := podOrdinalOffset(*clientCount)
 	log.Infof("Starting %d benchmark clients (IDs %d..%d)...", *clientCount, offset, offset+*clientCount-1)
 
@@ -167,13 +207,14 @@ func main() {
 	for i := 0; i < *clientCount; i++ {
 		clientID := fmt.Sprintf("benchmark-client-%d", offset+i)
 		serverID := fmt.Sprintf("benchmark-server-%d", offset+i)
+		nc := conns[i%len(conns)]
 
 		activeClients.Inc()
 		wg.Add(1)
-		go func(cid, sid string) {
+		go func(cid, sid string, nc *nats.Conn) {
 			defer wg.Done()
-			runClient(cid, sid, requestPayload, *natsURL, time.Duration(*requestTimeout)*time.Second, otelHandler)
-		}(clientID, serverID)
+			runClient(cid, sid, nc, requestPayload, time.Duration(*requestTimeout)*time.Second, otelHandler)
+		}(clientID, serverID, nc)
 
 		if i > 0 && i%100 == 0 {
 			time.Sleep(100 * time.Millisecond)

@@ -49,6 +49,7 @@ spec:
         args:
           - "--nats-url={{ .Values.nats.url }}"
           - "--client-count={{ .Values.client.clientCount }}"
+          - "--nats-connections={{ .Values.client.natsConnections }}"
           - "--payload-size={{ .Values.client.payloadSize }}"
           - "--metrics-port={{ .Values.client.metricsPort }}"
           - "--request-timeout={{ .Values.client.requestTimeout }}"

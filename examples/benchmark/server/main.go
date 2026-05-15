@@ -77,14 +77,39 @@ func setupOTelMetrics(serviceName string) (*sdkmetric.MeterProvider, error) {
 	), nil
 }
 
+// dialNATSPool opens n NATS connections to be shared across all server
+// goroutines on this pod. Sharing keeps the NATS cluster's connection count
+// proportional to pods, not servers — see ../client/main.go for details.
+func dialNATSPool(natsURL string, n int, namePrefix string) ([]*nats.Conn, error) {
+	conns := make([]*nats.Conn, 0, n)
+	for i := 0; i < n; i++ {
+		opts := []nats.Option{nats.Name(fmt.Sprintf("%s-%d", namePrefix, i))}
+		opts = rpc.SetupConnOptions(opts)
+		nc, err := nats.Connect(natsURL, opts...)
+		if err != nil {
+			for _, c := range conns {
+				c.Close()
+			}
+			return nil, fmt.Errorf("conn %d: %w", i, err)
+		}
+		conns = append(conns, nc)
+	}
+	return conns, nil
+}
+
 func main() {
 	var (
-		natsURL      = flag.String("nats-url", nats.DefaultURL, "NATS server URL")
-		serverCount  = flag.Int("server-count", 1000, "Number of servers to spawn")
-		payloadBytes = flag.Int("payload-size", 4096, "Payload size in bytes")
-		metricsPort  = flag.Int("metrics-port", 9090, "Prometheus metrics port")
+		natsURL         = flag.String("nats-url", nats.DefaultURL, "NATS server URL")
+		serverCount     = flag.Int("server-count", 1000, "Number of servers to spawn")
+		natsConnections = flag.Int("nats-connections", 4, "Number of shared NATS connections per pod (stripe-assigned to servers)")
+		payloadBytes    = flag.Int("payload-size", 4096, "Payload size in bytes")
+		metricsPort     = flag.Int("metrics-port", 9090, "Prometheus metrics port")
 	)
 	flag.Parse()
+	if *natsConnections < 1 {
+		log.Errorf("--nats-connections must be >= 1")
+		os.Exit(1)
+	}
 
 	mp, err := setupOTelMetrics("nats-grpc-benchmark-server")
 	if err != nil {
@@ -109,6 +134,22 @@ func main() {
 		responsePayload[i] = byte(i % 256)
 	}
 
+	podName := os.Getenv("POD_NAME")
+	if podName == "" {
+		podName = "server"
+	}
+	conns, err := dialNATSPool(*natsURL, *natsConnections, "nats-grpc-bench-"+podName)
+	if err != nil {
+		log.Errorf("dial NATS pool: %v", err)
+		os.Exit(1)
+	}
+	defer func() {
+		for _, c := range conns {
+			c.Close()
+		}
+	}()
+	log.Infof("Opened %d shared NATS connection(s)", len(conns))
+
 	var wg sync.WaitGroup
 	servers := make([]*rpc.Server, *serverCount)
 
@@ -121,16 +162,7 @@ func main() {
 			defer wg.Done()
 
 			serverID := fmt.Sprintf("benchmark-server-%d", offset+index)
-
-			opts := []nats.Option{nats.Name(fmt.Sprintf("nats-grpc benchmark server %d", index))}
-			opts = rpc.SetupConnOptions(opts)
-
-			nc, err := nats.Connect(*natsURL, opts...)
-			if err != nil {
-				log.Errorf("Server %d: failed to connect to NATS: %v", index, err)
-				return
-			}
-			defer nc.Close()
+			nc := conns[index%len(conns)]
 
 			ncs := rpc.NewServerWithOptions(nc, serverID,
 				rpc.WithServerStatsHandler(otelHandler),

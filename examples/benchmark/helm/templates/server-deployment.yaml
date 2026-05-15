@@ -49,6 +49,7 @@ spec:
         args:
           - "--nats-url={{ .Values.nats.url }}"
           - "--server-count={{ .Values.server.serverCount }}"
+          - "--nats-connections={{ .Values.server.natsConnections }}"
           - "--payload-size={{ .Values.server.payloadSize }}"
           - "--metrics-port={{ .Values.server.metricsPort }}"
         env:
