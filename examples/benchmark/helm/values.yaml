@@ -61,7 +61,12 @@ serviceMonitor:
 datadog:
   enabled: true
   namespace: "nats_grpc_benchmark"
-  metricsPattern: "grpc_*"  # Collect all gRPC metrics
+  # Patterns for the Datadog openmetrics check to collect. rpc_* covers the
+  # otelgrpc-emitted histograms (rpc_client_call_duration_seconds, etc.);
+  # grpc_* keeps the legacy custom gauge grpc_client_active_total.
+  metricsPatterns:
+    - "rpc_*"
+    - "grpc_*"
 
 # Tolerations - allow scheduling on nodes with GPU taints
 tolerations:

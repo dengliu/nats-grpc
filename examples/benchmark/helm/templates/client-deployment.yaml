@@ -29,7 +29,10 @@ spec:
             {
               "prometheus_url": "http://%%host%%:{{ .Values.client.metricsPort }}/metrics",
               "namespace": "{{ .Values.datadog.namespace }}",
-              "metrics": ["{{ .Values.datadog.metricsPattern }}"]
+              "metrics": {{ toJson .Values.datadog.metricsPatterns }},
+              "histogram_buckets_as_distributions": true,
+              "non_cumulative_histogram_buckets": true,
+              "collect_counters_with_distributions": true
             }
           ]
         {{- end }}
