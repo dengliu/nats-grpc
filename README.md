@@ -9,10 +9,10 @@ nats-grpc enables gRPC services to communicate over NATS message queue instead o
 ## Features
 
 * ✅ **Full gRPC Support**: Unary, Client-Streaming, Server-Streaming, and Bidirectional Streaming
-* ✅ **NATS QueueSubscribe**: Built-in load balancing across service instances
+* ✅ **Load-Balanced Unary RPCs**: Single-message NATS request/reply — safe to fan out across replicas via queue groups
 * ✅ **Metadata Support**: Complete support for gRPC metadata (headers/trailers)
 * ✅ **Service Discovery**: Unique service IDs for routing
-* ✅ **Heartbeat Monitoring**: Automatic detection of server failures during streaming (3-6 second detection)
+* ✅ **Heartbeat Monitoring**: Automatic detection of server failures during streaming RPCs (10–15s detection)
 * ✅ **Standard gRPC API**: Compatible with existing gRPC code and tools
 * ✅ **Reflection Support**: gRPC server reflection for dynamic service discovery
 
@@ -100,33 +100,43 @@ sequenceDiagram
 
 #### 3. Protocol Messages
 
-The `nrpc` protocol wraps gRPC messages in Protocol Buffer envelopes:
+The `nrpc` protocol wraps gRPC messages in Protocol Buffer envelopes. Unary
+RPCs use the `UnaryRequest` / `UnaryResponse` variants (single message in,
+single message out via NATS request/reply); streaming RPCs use the
+`Call`/`Data`/`End` framing:
 
 ```protobuf
 // Request messages (Client → Server)
 message Request {
   oneof type {
-    Call call = 2;     // Initiates RPC with method & metadata
-    Data data = 3;     // Streaming data payload
-    End end = 4;       // Closes stream
-    Ping ping = 5;     // Heartbeat keepalive
+    Call         call  = 2;  // Streaming: initiates RPC with method & metadata
+    Data         data  = 3;  // Streaming: data payload
+    End          end   = 4;  // Streaming: closes stream
+    Ping         ping  = 5;  // Streaming: heartbeat keepalive
+    UnaryRequest unary = 6;  // Unary: one-shot request (method + metadata + data)
   }
 }
 
 // Response messages (Server → Client)
 message Response {
   oneof type {
-    Begin begin = 2;   // Starts response with metadata
-    Data data = 3;     // Streaming data payload
-    End end = 4;       // Closes stream with status
-    Pong pong = 5;     // Heartbeat acknowledgment
+    Begin         begin = 2;  // Streaming: starts response with metadata
+    Data          data  = 3;  // Streaming: data payload
+    End           end   = 4;  // Streaming: closes stream with status
+    Pong          pong  = 5;  // Streaming: heartbeat acknowledgment
+    UnaryResponse unary = 6;  // Unary: one-shot reply (header + trailer + status + data)
   }
 }
 ```
 
 #### 4. Unary RPC Implementation
 
-Unary RPCs (single request, single response) are the simplest form of gRPC call. They follow a straightforward request-reply pattern over NATS:
+Unary RPCs use NATS's native request/reply pattern under the hood
+(`nc.RequestWithContext`): **one publish, one reply**. The entire RPC —
+method, metadata, payload — is bundled into a single `UnaryRequest`, and the
+server replies with a single `UnaryResponse`. This makes queue-group load
+balancing across server replicas safe by construction: there is no second
+message that could land on a different replica.
 
 ```mermaid
 sequenceDiagram
@@ -134,61 +144,70 @@ sequenceDiagram
     participant NATS
     participant Server
 
-    Note over Client,Server: Unary RPC Call
-    
-    Client->>NATS: Request.Call + Request.Data<br/>(method, metadata, payload)
-    NATS->>Server: Deliver (QueueSubscribe)
+    Note over Client,Server: Unary RPC Call (single request/reply)
+
+    Client->>NATS: Request.UnaryRequest<br/>(method, metadata, payload)
+    NATS->>Server: Deliver (QueueSubscribe — one replica)
     Note over Server: Invoke handler<br/>Process request
-    Server->>NATS: Response.Begin + Response.Data + Response.End<br/>(headers, payload, trailers, status)
+    Server->>NATS: Response.UnaryResponse<br/>(header, trailer, status, payload)
     NATS->>Client: Deliver to reply inbox
     Note over Client: Return result to caller
 ```
 
 **Message Flow for Unary RPC:**
 
-1. **Client sends:**
-   - `Request.Call`: Contains method name, metadata (headers)
-   - `Request.Data`: Contains the protobuf-serialized request message
-   - Both messages sent to the service subject (e.g., `nrpc.auth.AuthService.Login`)
+1. **Client sends one message** to the service subject (e.g.
+   `nrpc.auth.AuthService.Login`):
+   - `Request.UnaryRequest { method, metadata, data }`
+   - Dispatch uses `nc.RequestWithContext`, so a unique reply inbox is set up
+     and torn down automatically — no per-call NATS subscription churn.
 
-2. **Server responds:**
-   - `Response.Begin`: Contains response metadata (headers) and server node ID
-   - `Response.Data`: Contains the protobuf-serialized response message
-   - `Response.End`: Contains status code, error message (if any), and trailers
-   - All messages sent to the client's unique reply inbox
+2. **Server replies with one message** on the client's reply inbox:
+   - `Response.UnaryResponse { header, trailer, status, data }`
+   - `status` carries the gRPC code/message (OK for success, otherwise the
+     handler error).
 
-3. **Client receives:**
-   - Waits for all three response messages
-   - Unmarshals the response payload
-   - Returns result or error to the caller
+3. **Client receives one message** and:
+   - Populates any `grpc.Header(&md)` / `grpc.Trailer(&md)` call options.
+   - If `status` is non-OK, returns it as a gRPC `status.Error`.
+   - Otherwise unmarshals `data` into the response proto.
 
 **Key Characteristics:**
 
-- **Single request/response**: Unlike streaming, only one request and one response message
-- **Synchronous**: Client blocks waiting for the response
-- **Timeout handling**: Uses context deadlines for request timeout
-- **Load balanced**: NATS QueueSubscribe distributes requests across server instances
-- **Stateless**: No long-lived connection or stream state maintained
+- **Single request/response**: One NATS publish each way.
+- **Safe load balancing**: Multiple servers can share a queue group; every
+  RPC lands on exactly one replica.
+- **No per-call subscription**: NATS's shared inbox is reused for all unary
+  calls on the connection — high RPS doesn't churn subscriptions.
+- **Synchronous**: Client blocks waiting for the response; context deadlines
+  drive timeouts (`context.DeadlineExceeded` → `codes.DeadlineExceeded`).
+- **Failure mapping**: `nats.ErrNoResponders` → `codes.Unavailable`.
 
 **Example Protocol Sequence:**
 
 ```
-Client → NATS: nrpc.auth.Login
-  Request.Call {method: "/auth.AuthService/Login", metadata: {}}
-  Request.Data {data: <serialized LoginRequest>}
+Client → NATS: nrpc.auth.AuthService.Login
+  Request.UnaryRequest {
+    method:   "/auth.AuthService/Login"
+    metadata: {...}
+    data:     <serialized LoginRequest>
+  }
 
-Server → NATS: _INBOX.client123
-  Response.Begin {headers: {}, nid: "server-1"}
-  Response.Data {data: <serialized LoginResponse>}
-  Response.End {status: {code: 0, message: "OK"}, trailer: {}}
+Server → NATS: _INBOX.<client-conn>.<rand>
+  Response.UnaryResponse {
+    header:  {...}
+    trailer: {...}
+    status:  { code: 0, message: "OK" }
+    data:    <serialized LoginResponse>
+  }
 ```
 
 **Performance Considerations:**
 
-- Minimal overhead: Only 2 request messages + 3 response messages
-- Fast path: No stream setup or teardown
-- Efficient: Leverages NATS's optimized request-reply pattern
-- Low latency: Direct subject-to-inbox delivery
+- Minimal overhead: 1 request + 1 reply on the wire.
+- No stream setup/teardown, no heartbeat goroutines per call.
+- Efficient: leverages NATS's optimized request/reply path with a shared
+  per-connection inbox subscription.
 
 #### 5. Streaming Implementation
 
@@ -226,32 +245,37 @@ sequenceDiagram
 
 #### 5. Heartbeat Mechanism
 
-To detect server failures during streaming, a heartbeat protocol is implemented:
+To detect server failures during **streaming** RPCs, a heartbeat protocol is
+implemented. (Unary RPCs do not use the heartbeat — they rely on the
+`nc.RequestWithContext` deadline; `nats.ErrNoResponders` surfaces as
+`codes.Unavailable` instantly.) Streaming requires a non-empty `nid`
+(point-to-point addressing) so that Ping/Pong reaches the same replica that
+owns the stream — see [HEARTBEAT.md](./HEARTBEAT.md) for details.
 
 ```mermaid
 sequenceDiagram
     participant Client
     participant Server
-    
-    Note over Client: pingLoop (every 2s)
-    Note over Client: pongMonitor (timeout 5s)
-    
+
+    Note over Client: pingLoop (every 5s)
+    Note over Client: pongMonitor (timeout 15s)
+
     Client->>Server: Request.Ping (timestamp)
     Server->>Client: Response.Pong (timestamp)
     Note over Client: Update lastPongTime
-    
+
     Client->>Server: Request.Ping
     Server->>Client: Response.Pong
-    
+
     Client->>Server: Request.Ping
     Note over Server: Server crashes ❌
-    
-    Note over Client: Wait 5 seconds...
+
+    Note over Client: Wait 15 seconds...
     Note over Client: No Pong received!
     Note over Client: Close stream with<br/>Unavailable error
 ```
 
-**Detection Time**: 3-6 seconds after server failure
+**Detection Time**: 10–15 seconds after server failure
 
 ### Load Balancing with NATS QueueSubscribe
 
@@ -277,10 +301,19 @@ graph LR
 ```
 
 **How it works:**
-1. Multiple server instances subscribe to the same subject with a queue group name
-2. NATS automatically distributes requests across instances (round-robin)
-3. Each request is delivered to exactly one server instance
-4. If a server fails, NATS stops sending requests to it
+1. Multiple server instances subscribe to the same subject with a queue group name.
+2. NATS distributes each message in the queue group to exactly one subscriber.
+3. If a server fails, NATS stops sending requests to it.
+
+**Safety note — unary vs. streaming under load balancing:**
+
+- **Unary RPCs are safe to load-balance** across multiple replicas sharing the
+  same `nid`. Because the whole RPC is a single request/reply message pair,
+  the call always lands on exactly one replica.
+- **Streaming RPCs cannot be load-balanced.** They span multiple messages
+  (`Call`, `Data`, `End`, ...) that must reach the same replica to preserve
+  stream state. Use a unique `nid` per streaming server so the subject is
+  point-to-point and no queue-group fan-out occurs.
 
 ### Complete Data Flow Architecture
 
@@ -435,12 +468,14 @@ client := rpc.NewClient(nc, "auth-service-v2", "web-app")
 
 ### Heartbeat Monitoring
 
-Automatic detection of server failures during streaming (see [HEARTBEAT.md](./HEARTBEAT.md)):
+Automatic detection of server failures during **streaming** RPCs (see
+[HEARTBEAT.md](./HEARTBEAT.md)). Unary RPCs do not use heartbeats — they
+rely on the request/reply deadline.
 
-- Client sends Ping every 2 seconds
+- Client sends Ping every 5 seconds
 - Server responds with Pong immediately
-- Client detects failure if no Pong within 5 seconds
-- Detection time: 3-6 seconds
+- Client detects failure if no Pong within 15 seconds
+- Detection time: 10–15 seconds
 
 ### gRPC Reflection
 
@@ -464,7 +499,7 @@ See the `examples/` directory for complete working examples:
 
 ## Requirements
 
-- Go 1.20 or later
+- Go 1.26 or later
 - NATS Server 2.x
 - Protocol Buffers compiler (protoc)
 
