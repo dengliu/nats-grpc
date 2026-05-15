@@ -63,8 +63,9 @@ func setupOTelMetrics(serviceName string) (*sdkmetric.MeterProvider, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create prometheus exporter: %w", err)
 	}
-	res, err := resource.Merge(resource.Default(), resource.NewWithAttributes(
-		semconv.SchemaURL,
+	// NewSchemaless avoids a Merge conflict when the SDK's default resource
+	// uses a different semconv schema URL than this package's import.
+	res, err := resource.Merge(resource.Default(), resource.NewSchemaless(
 		semconv.ServiceName(serviceName),
 	))
 	if err != nil {
