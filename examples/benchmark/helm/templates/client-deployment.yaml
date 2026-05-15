@@ -27,7 +27,7 @@ spec:
         ad.datadoghq.com/client.instances: |
           [
             {
-              "prometheus_url": "http://%%host%%:{{ .Values.client.metricsPort }}/metrics",
+              "openmetrics_endpoint": "http://%%host%%:{{ .Values.client.metricsPort }}/metrics",
               "namespace": "{{ .Values.datadog.namespace }}",
               "metrics": {{ toJson .Values.datadog.metricsPatterns }},
               "histogram_buckets_as_distributions": true,
