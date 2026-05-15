@@ -31,6 +31,7 @@ The benchmark spawns N server instances and N client instances, where each clien
 - **Prometheus Metrics**: Comprehensive metrics for monitoring
 - **Independent Connections**: Each client and server has its own NATS connection
 - **Graceful Shutdown**: Clean shutdown on SIGINT/SIGTERM
+- **Kubernetes Support**: Deploy at scale with Helm chart
 
 ## Prerequisites
 
@@ -41,7 +42,7 @@ The benchmark spawns N server instances and N client instances, where each clien
 
 2. **Generate Proto Files** (if not already done):
    ```bash
-   cd examples
+   cd examples/benchmark
    mkdir -p protos/benchmark
    protoc -I ./protos \
      --go_out=./protos/benchmark \
@@ -49,16 +50,16 @@ The benchmark spawns N server instances and N client instances, where each clien
      ./protos/benchmark.proto
    ```
 
-## Usage
+## Local Usage
 
 ### Start the Server
 
 ```bash
 # Start with default settings (1000 servers, 4KB payload)
-go run examples/benchmark/server/main.go
+go run server/main.go
 
 # Start with custom settings
-go run examples/benchmark/server/main.go \
+go run server/main.go \
   --server-count=100 \
   --payload-size=8192 \
   --nats-url=nats://localhost:4222 \
@@ -69,10 +70,10 @@ go run examples/benchmark/server/main.go \
 
 ```bash
 # Start with default settings (1000 clients, 4KB payload)
-go run examples/benchmark/client/main.go
+go run client/main.go
 
 # Start with custom settings
-go run examples/benchmark/client/main.go \
+go run client/main.go \
   --client-count=100 \
   --payload-size=8192 \
   --nats-url=nats://localhost:4222 \
@@ -98,6 +99,7 @@ go run examples/benchmark/client/main.go \
 | `--client-count` | `1000` | Number of clients to spawn |
 | `--payload-size` | `4096` | Request payload size in bytes |
 | `--metrics-port` | `9091` | Prometheus metrics HTTP port |
+| `--request-timeout` | `5` | gRPC request timeout in seconds |
 
 ## Metrics
 
@@ -123,10 +125,10 @@ For testing, start with a smaller number of clients/servers:
 nats-server
 
 # Terminal 2: Start 10 servers
-go run examples/benchmark/server/main.go --server-count=10
+go run server/main.go --server-count=10
 
 # Terminal 3: Start 10 clients
-go run examples/benchmark/client/main.go --client-count=10
+go run client/main.go --client-count=10
 
 # Terminal 4: View server metrics
 curl http://localhost:9090/metrics | grep grpc_server_requests_total
@@ -144,12 +146,12 @@ For a full-scale benchmark:
 nats-server
 
 # Terminal 2: Start 1000 servers with 4KB payloads
-go run examples/benchmark/server/main.go \
+go run server/main.go \
   --server-count=1000 \
   --payload-size=4096
 
 # Terminal 3: Start 1000 clients with 4KB payloads
-go run examples/benchmark/client/main.go \
+go run client/main.go \
   --client-count=1000 \
   --payload-size=4096
 ```
@@ -159,6 +161,174 @@ Expected behavior:
 - Each client sends 1 request/second
 - Total system throughput: 1000 requests/second
 - Total payload throughput: ~8 MB/s (4KB request + 4KB response) × 1000
+
+## Kubernetes Deployment with Helm
+
+For production-scale deployments, use the included Helm chart to deploy the benchmark on Kubernetes.
+
+### Helm Prerequisites
+
+- Kubernetes cluster (1.19+)
+- Helm 3.0+
+- NATS server running in the cluster
+- (Optional) Prometheus Operator for ServiceMonitor support
+
+### Building the Docker Image
+
+From the `examples/benchmark` directory:
+
+```bash
+# Build for linux/amd64 platform (required for most Kubernetes clusters)
+docker build --platform -t nats-grpc-benchmark:latest -f Dockerfile ../..
+```
+
+If using a registry:
+
+```bash
+# Build and push for linux/amd64 platform in one command
+docker build --platform linux/amd64 --push -t us-central1-docker.pkg.dev/encoded-stage-394013/containers/nats-grpc-benchmark:latest -f Dockerfile ../..
+```
+
+**Note**: The `--platform linux/amd64` flag is important to ensure the image is compatible with amd64-based Kubernetes nodes, especially if building on ARM-based machines (e.g., Apple Silicon M1/M2).
+
+### Installing the Helm Chart
+
+```bash
+# Install/upgrade with default values
+helm upgrade --install nats-grpc-benchmark -n sub-agent ./helm
+```
+
+```bash
+# Install/upgrade with custom values
+helm upgrade --install nats-grpc-benchmark ./helm \
+  --set image.repository=your-registry/nats-grpc-benchmark \
+  --set nats.url=nats://your-nats-server:4222 \
+  --set server.replicaCount=10 \
+  --set client.replicaCount=10
+```
+
+### Helm Configuration
+
+#### Key Parameters
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `image.repository` | Image repository | `nats-grpc-benchmark` |
+| `image.tag` | Image tag | `latest` |
+| `nats.url` | NATS server URL | `nats://nats:4222` |
+| `server.enabled` | Enable server deployment | `true` |
+| `server.replicaCount` | Number of server pods | `10` |
+| `server.serverCount` | Servers per pod | `100` |
+| `client.enabled` | Enable client deployment | `true` |
+| `client.replicaCount` | Number of client pods | `10` |
+| `client.clientCount` | Clients per pod | `100` |
+| `serviceMonitor.enabled` | Enable Prometheus ServiceMonitor | `false` |
+
+See `helm/values.yaml` for all available configuration options.
+
+### Scaling on Kubernetes
+
+Total servers/clients = replicaCount × count per pod
+
+Examples:
+- 10 pods × 100 servers = 1000 total servers
+- 10 pods × 100 clients = 1000 total clients
+
+Adjust based on your cluster resources:
+
+```bash
+# Scale to 5000 clients total (50 pods × 100 clients)
+helm upgrade --install nats-grpc-benchmark ./helm \
+  --set client.replicaCount=50 \
+  --set client.clientCount=100
+```
+
+### Kubernetes Monitoring
+
+#### Datadog Metrics Export
+
+The Helm chart is configured to export metrics to Datadog by default using Autodiscovery annotations. The Datadog Agent DaemonSet will automatically discover and scrape metrics from the pods.
+
+**Configuration in `values.yaml`:**
+```yaml
+datadog:
+  enabled: true  # Enable/disable Datadog autodiscovery
+  namespace: "nats_grpc_benchmark"  # Datadog metrics namespace
+  metricsPattern: "grpc_*"  # Metrics pattern to collect
+```
+
+**Metrics Available in Datadog:**
+- `nats_grpc_benchmark.grpc_server_requests_total`
+- `nats_grpc_benchmark.grpc_server_request_duration_seconds`
+- `nats_grpc_benchmark.grpc_server_payload_bytes`
+- `nats_grpc_benchmark.grpc_client_requests_total`
+- `nats_grpc_benchmark.grpc_client_request_duration_seconds`
+- `nats_grpc_benchmark.grpc_client_payload_bytes`
+- `nats_grpc_benchmark.grpc_client_active_total`
+
+**To disable Datadog and use Prometheus instead:**
+```bash
+helm upgrade --install nats-grpc-benchmark ./helm \
+  --set datadog.enabled=false \
+  --set serviceMonitor.enabled=true
+```
+
+#### Prometheus Metrics on Kubernetes
+
+Both client and server expose Prometheus metrics:
+- Server: `http://<pod-ip>:9090/metrics`
+- Client: `http://<pod-ip>:9091/metrics`
+
+#### Enable ServiceMonitor
+
+If using Prometheus Operator (when Datadog is disabled):
+
+```bash
+helm upgrade --install nats-grpc-benchmark ./helm \
+  --set datadog.enabled=false \
+  --set serviceMonitor.enabled=true
+```
+
+#### Port Forward for Local Access
+
+```bash
+# Server metrics
+kubectl port-forward svc/nats-grpc-benchmark-server 9090:9090
+
+# Client metrics  
+kubectl port-forward svc/nats-grpc-benchmark-client 9091:9091
+```
+
+### Kubernetes Architecture
+
+```
+┌─────────────────┐
+│ Client Pod 1    │──┐
+│ (100 clients)   │  │
+└─────────────────┘  │
+                     │    ┌──────────┐
+┌─────────────────┐  │    │          │     ┌─────────────────┐
+│ Client Pod 2    │──┼───▶│   NATS   │◀────┤ Server Pod 1    │
+│ (100 clients)   │  │    │          │     │ (100 servers)   │
+└─────────────────┘  │    └──────────┘     └─────────────────┘
+                     │                             ▲
+        ...          │                             │
+                     │                             │
+┌─────────────────┐  │                      ┌─────────────────┐
+│ Client Pod N    │──┘                      │ Server Pod N    │
+│ (100 clients)   │                         │ (100 servers)   │
+└─────────────────┘                         └─────────────────┘
+        │                                           │
+        │                                           │
+        ▼                                           ▼
+   Metrics:9091                               Metrics:9090
+```
+
+### Uninstalling the Helm Chart
+
+```bash
+helm uninstall nats-grpc-benchmark
+```
 
 ## Monitoring with Prometheus
 
@@ -223,25 +393,60 @@ For large-scale benchmarks (1000+ clients), consider:
 
 ## Troubleshooting
 
-### Too many open files
+### Local Development
+
+#### Too many open files
 
 ```bash
 # Increase file descriptor limit
 ulimit -n 10000
 ```
 
-### NATS connection errors
+#### NATS connection errors
 
 - Ensure NATS server is running: `nats-server`
 - Check NATS server logs for errors
 - Verify `--nats-url` flag is correct
 
-### Metrics not showing
+#### Metrics not showing
 
 - Verify metrics ports are accessible: `curl http://localhost:9090/metrics`
 - Check for port conflicts
 - Ensure clients/servers are running
 
+### Kubernetes Deployment
+
+#### Check Pod Status
+
+```bash
+kubectl get pods -l release=nats-grpc-benchmark
+```
+
+#### View Logs
+
+```bash
+# Server logs
+kubectl logs -l app=nats-grpc-benchmark-server
+
+# Client logs
+kubectl logs -l app=nats-grpc-benchmark-client
+```
+
+#### Check Metrics in Kubernetes
+
+```bash
+# Check if metrics are being exported
+kubectl exec -it <pod-name> -- wget -q -O- localhost:9090/metrics | head
+```
+
 ## Cleanup
 
+### Local Development
+
 Stop the benchmark with `Ctrl+C` in each terminal. The applications will gracefully shut down.
+
+### Kubernetes
+
+```bash
+helm uninstall nats-grpc-benchmark
+```

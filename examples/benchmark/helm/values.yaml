@@ -2,13 +2,13 @@
 
 # Image configuration
 image:
-  repository: nats-grpc-benchmark
-  pullPolicy: IfNotPresent
+  repository: us-central1-docker.pkg.dev/encoded-stage-394013/containers/nats-grpc-benchmark
+  pullPolicy: Always
   tag: "latest"
 
 # NATS server connection
 nats:
-  url: "nats://nats:4222"
+  url: "nats://nats.gke.internal:4222"
 
 # Server configuration
 server:
@@ -17,15 +17,15 @@ server:
   serverCount: 100  # Number of servers per pod
   payloadSize: 4096
   metricsPort: 9090
-  
+
   resources:
     limits:
-      cpu: 500m
-      memory: 512Mi
+      cpu: "8"
+      memory: 32Gi
     requests:
-      cpu: 100m
-      memory: 128Mi
-  
+      cpu: "8"
+      memory: 32Gi
+
   service:
     type: ClusterIP
     metricsPort: 9090
@@ -37,15 +37,16 @@ client:
   clientCount: 100  # Number of clients per pod
   payloadSize: 4096
   metricsPort: 9091
-  
+  requestTimeout: 30  # gRPC request timeout in seconds
+
   resources:
     limits:
-      cpu: 500m
-      memory: 512Mi
+      cpu: "8"
+      memory: 32Gi
     requests:
-      cpu: 100m
-      memory: 128Mi
-  
+      cpu: "8"
+      memory: 32Gi
+
   service:
     type: ClusterIP
     metricsPort: 9091
@@ -55,3 +56,16 @@ serviceMonitor:
   enabled: false
   interval: 30s
   scrapeTimeout: 10s
+
+# Datadog configuration for metrics export
+datadog:
+  enabled: true
+  namespace: "nats_grpc_benchmark"
+  metricsPattern: "grpc_*"  # Collect all gRPC metrics
+
+# Tolerations - allow scheduling on nodes with GPU taints
+tolerations:
+  - key: nvidia.com/gpu
+    operator: Equal
+    value: present
+    effect: NoSchedule

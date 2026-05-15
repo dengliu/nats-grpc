@@ -19,10 +19,23 @@ spec:
         app: {{ include "nats-grpc-benchmark.name" . }}-server
         release: {{ .Release.Name }}
       annotations:
-        prometheus.io/scrape: "true"
-        prometheus.io/port: "{{ .Values.server.metricsPort }}"
-        prometheus.io/path: "/metrics"
+        {{- if .Values.datadog.enabled }}
+        ad.datadoghq.com/server.check_names: '["openmetrics"]'
+        ad.datadoghq.com/server.init_configs: '[{}]'
+        ad.datadoghq.com/server.instances: |
+          [
+            {
+              "prometheus_url": "http://%%host%%:{{ .Values.server.metricsPort }}/metrics",
+              "namespace": "{{ .Values.datadog.namespace }}",
+              "metrics": ["{{ .Values.datadog.metricsPattern }}"]
+            }
+          ]
+        {{- end }}
     spec:
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
       - name: server
         image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"

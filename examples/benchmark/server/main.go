@@ -10,12 +10,12 @@ import (
 	"sync"
 	"syscall"
 
-	"github.com/cloudwebrtc/nats-grpc/examples/protos/benchmark"
+	"github.com/cloudwebrtc/nats-grpc/examples/benchmark/protos/benchmark"
 	"github.com/cloudwebrtc/nats-grpc/pkg/rpc"
 	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
 	"github.com/nats-io/nats.go"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	log "github.com/pion/ion-log"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 type benchmarkServer struct {

@@ -11,10 +11,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/cloudwebrtc/nats-grpc/examples/protos/benchmark"
+	"github.com/cloudwebrtc/nats-grpc/examples/benchmark/protos/benchmark"
 	"github.com/cloudwebrtc/nats-grpc/pkg/rpc"
-	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
 	"github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/timeout"
+	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
 	"github.com/nats-io/nats.go"
 	log "github.com/pion/ion-log"
 	"github.com/prometheus/client_golang/prometheus"
@@ -38,7 +38,7 @@ func init() {
 	prometheus.MustRegister(activeClients)
 }
 
-func runClient(clientID string, serverID string, requestPayload []byte, natsURL string) {
+func runClient(clientID string, serverID string, requestPayload []byte, natsURL string, requestTimeout time.Duration) {
 	defer activeClients.Dec()
 
 	// Create individual NATS connection for this client
@@ -54,8 +54,8 @@ func runClient(clientID string, serverID string, requestPayload []byte, natsURL 
 
 	// Chain timeout and Prometheus interceptors
 	chainedInterceptor := func(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
-		// Apply timeout interceptor first
-		timeoutInt := timeout.UnaryClientInterceptor(5 * time.Second)
+		// Apply timeout interceptor first with configurable timeout
+		timeoutInt := timeout.UnaryClientInterceptor(requestTimeout)
 		return timeoutInt(ctx, method, req, reply, cc, func(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, opts ...grpc.CallOption) error {
 			// Then apply Prometheus interceptor
 			return grpc_prometheus.UnaryClientInterceptor(ctx, method, req, reply, cc, invoker, opts...)
@@ -91,10 +91,11 @@ func runClient(clientID string, serverID string, requestPayload []byte, natsURL 
 
 func main() {
 	var (
-		natsURL      = flag.String("nats-url", nats.DefaultURL, "NATS server URL")
-		clientCount  = flag.Int("client-count", 1000, "Number of clients to spawn")
-		payloadBytes = flag.Int("payload-size", 4096, "Payload size in bytes")
-		metricsPort  = flag.Int("metrics-port", 9091, "Prometheus metrics port")
+		natsURL        = flag.String("nats-url", nats.DefaultURL, "NATS server URL")
+		clientCount    = flag.Int("client-count", 1000, "Number of clients to spawn")
+		payloadBytes   = flag.Int("payload-size", 4096, "Payload size in bytes")
+		metricsPort    = flag.Int("metrics-port", 9091, "Prometheus metrics port")
+		requestTimeout = flag.Int("request-timeout", 5, "gRPC request timeout in seconds")
 	)
 	flag.Parse()
 
@@ -127,7 +128,7 @@ func main() {
 
 		go func(cid, sid string) {
 			defer wg.Done()
-			runClient(cid, sid, requestPayload, *natsURL)
+			runClient(cid, sid, requestPayload, *natsURL, time.Duration(*requestTimeout)*time.Second)
 		}(clientID, serverID)
 
 		// Small delay to avoid overwhelming connection setup
