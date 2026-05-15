@@ -3,6 +3,7 @@ package rpc
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -15,6 +16,9 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
@@ -271,4 +275,88 @@ type errSrv struct {
 
 func (errSrv) Execute(ctx context.Context, req *benchmark.BenchmarkRequest) (*benchmark.BenchmarkResponse, error) {
 	return nil, status.Error(codes.FailedPrecondition, "intentional")
+}
+
+// TestIntegration_OTelGrpc_DurationRecorded plugs otelgrpc's stats handlers
+// into both client and server, runs one RPC, then reads back metrics from a
+// manual-reader MeterProvider and asserts that a duration histogram was
+// recorded. This is the end-to-end proof that the new stats.Handler plumbing
+// in pkg/rpc cleanly drives otelgrpc — the original motivation for
+// WithStatsHandler / WithServerStatsHandler.
+func TestIntegration_OTelGrpc_DurationRecorded(t *testing.T) {
+	url := runEmbeddedNATS(t)
+
+	// Manual reader lets us synchronously snapshot recorded metrics.
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = mp.Shutdown(context.Background()) })
+
+	clientHandler := otelgrpc.NewClientHandler(otelgrpc.WithMeterProvider(mp))
+	serverHandler := otelgrpc.NewServerHandler(otelgrpc.WithMeterProvider(mp))
+
+	// Server.
+	scn, err := nats.Connect(url)
+	require.NoError(t, err)
+	defer scn.Close()
+	srv := NewServerWithOptions(scn, "svc-otel", WithServerStatsHandler(serverHandler))
+	benchmark.RegisterBenchmarkServer(srv, &benchSrv{id: "svc-otel"})
+	t.Cleanup(srv.Stop)
+
+	// Client.
+	ccn, err := nats.Connect(url)
+	require.NoError(t, err)
+	defer ccn.Close()
+	cli := benchmark.NewBenchmarkClient(NewClientWithOptions(ccn, "svc-otel", "client-otel",
+		WithStatsHandler(clientHandler)))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err = cli.Execute(ctx, &benchmark.BenchmarkRequest{Payload: []byte("hello")})
+	require.NoError(t, err)
+
+	// Pull metrics. Both client and server sides should have recorded
+	// a duration histogram (exact instrument name depends on otelgrpc
+	// version — rpc.client.duration / rpc.server.duration historically,
+	// rpc.client.request.duration / rpc.server.request.duration on
+	// newer semconv).
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(ctx, &rm))
+
+	have := map[string]bool{}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			have[m.Name] = true
+		}
+	}
+	t.Logf("recorded metrics: %v", keys(have))
+
+	// Client-side and server-side duration must both be present.
+	assert.True(t, hasMatching(have, "rpc.client", "duration"),
+		"expected a client-side rpc duration histogram, got %v", keys(have))
+	assert.True(t, hasMatching(have, "rpc.server", "duration"),
+		"expected a server-side rpc duration histogram, got %v", keys(have))
+}
+
+func keys(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
+func hasMatching(have map[string]bool, parts ...string) bool {
+	for name := range have {
+		ok := true
+		for _, p := range parts {
+			if !strings.Contains(name, p) {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return true
+		}
+	}
+	return false
 }

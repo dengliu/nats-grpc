@@ -13,6 +13,7 @@ nats-grpc enables gRPC services to communicate over NATS message queue instead o
 * ✅ **Metadata Support**: Complete support for gRPC metadata (headers/trailers)
 * ✅ **Service Discovery**: Unique service IDs for routing
 * ✅ **Heartbeat Monitoring**: Automatic detection of server failures during streaming RPCs (10–15s detection)
+* ✅ **Stats Handler Integration**: `WithStatsHandler` / `WithServerStatsHandler` accept any `google.golang.org/grpc/stats.Handler` — works with `otelgrpc` (metrics, traces) and any other handler that targets the standard interface
 * ✅ **Standard gRPC API**: Compatible with existing gRPC code and tools
 * ✅ **Reflection Support**: gRPC server reflection for dynamic service discovery
 
@@ -487,6 +488,70 @@ import "github.com/cloudwebrtc/nats-grpc/pkg/rpc/reflection"
 server := rpc.NewServer(nc, "my-service")
 reflection.Register(server) // Enable reflection
 ```
+
+### Observability — `stats.Handler` Integration
+
+`pkg/rpc` invokes `google.golang.org/grpc/stats.Handler` callbacks at the
+standard gRPC lifecycle points (`TagRPC`, `Begin`, `OutPayload`, `InPayload`,
+`End`) for both unary and streaming RPCs, on both client and server. Anything
+implementing `stats.Handler` plugs in — `otelgrpc`, custom histograms, audit
+loggers, etc. — without `pkg/rpc` depending on any specific provider.
+
+#### OpenTelemetry / `otelgrpc` (metrics + tracing)
+
+```go
+import (
+    "go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
+    otelprom "go.opentelemetry.io/otel/exporters/prometheus"
+    sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+)
+
+// One-time setup: a MeterProvider whose metrics are exposed via the
+// existing Prometheus /metrics endpoint.
+exporter, _ := otelprom.New()
+mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(exporter))
+defer mp.Shutdown(context.Background())
+
+// Server side.
+srv := rpc.NewServerWithOptions(nc, "my-svc",
+    rpc.WithServerStatsHandler(otelgrpc.NewServerHandler(otelgrpc.WithMeterProvider(mp))),
+)
+
+// Client side.
+cli := rpc.NewClientWithOptions(nc, "my-svc", "client-1",
+    rpc.WithStatsHandler(otelgrpc.NewClientHandler(otelgrpc.WithMeterProvider(mp))),
+)
+```
+
+This produces `rpc.client.call.duration` and `rpc.server.call.duration`
+histograms (plus request/response size metrics and gRPC spans if you also
+configure a `TracerProvider`). The Prometheus exporter registers with
+`prometheus.DefaultRegisterer`, so existing `promhttp.Handler()` scrape
+endpoints automatically include the OTel metrics — no scrape config change
+needed. See `examples/benchmark/{client,server}/main.go` for a complete
+working setup.
+
+#### Custom handler
+
+```go
+type latencyLogger struct{}
+
+func (latencyLogger) TagRPC(ctx context.Context, info *stats.RPCTagInfo) context.Context {
+    return context.WithValue(ctx, "begin", time.Now())
+}
+func (latencyLogger) HandleRPC(ctx context.Context, s stats.RPCStats) {
+    if end, ok := s.(*stats.End); ok {
+        log.Printf("rpc %s took %s err=%v", "?", end.EndTime.Sub(end.BeginTime), end.Error)
+    }
+}
+func (latencyLogger) TagConn(ctx context.Context, _ *stats.ConnTagInfo) context.Context { return ctx }
+func (latencyLogger) HandleConn(context.Context, stats.ConnStats)                        {}
+
+srv := rpc.NewServerWithOptions(nc, "svc", rpc.WithServerStatsHandler(latencyLogger{}))
+```
+
+Multiple handlers can be registered — they fire in registration order at
+each event, matching grpc-go's behavior.
 
 ## Examples
 

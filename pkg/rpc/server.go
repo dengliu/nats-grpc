@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"time"
 
 	"github.com/cloudwebrtc/nats-grpc/pkg/protos/nrpc"
 	"github.com/cloudwebrtc/nats-grpc/pkg/utils"
@@ -15,6 +16,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/stats"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
@@ -71,6 +73,14 @@ func serverUnaryHandler(srv interface{}, handler serverMethodHandler) handlerFun
 // queue subscription. The request is delivered as a UnaryRequest and the reply
 // is written back to msg.Reply via msg.Respond — no per-call subscription or
 // stream state is created on either side.
+//
+// Lifecycle events fired to any registered stats.Handler:
+//
+//	TagRPC → Begin → InPayload(request) → OutPayload(response) → End
+//
+// End fires exactly once with the handler's error (or nil on success);
+// framework-level errors (marshal/respond) are logged but don't override
+// the handler's error in the End event.
 func serverUnaryRequestHandler(srv interface{}, handler serverMethodHandler) unaryHandler {
 	return func(s *Server, msg *nats.Msg, ureq *nrpc.UnaryRequest) {
 		interceptor := s.unaryInt
@@ -84,6 +94,15 @@ func serverUnaryRequestHandler(srv interface{}, handler serverMethodHandler) una
 			ctx = metadata.NewIncomingContext(ctx, md)
 		}
 
+		ctx = s.tagRPC(ctx, &stats.RPCTagInfo{FullMethodName: ureq.Method})
+		beginTime := time.Now()
+		s.handleRPC(ctx, &stats.Begin{BeginTime: beginTime})
+		s.handleRPC(ctx, &stats.InPayload{
+			Length:           len(ureq.Data),
+			CompressedLength: len(ureq.Data),
+			RecvTime:         time.Now(),
+		})
+
 		// dec is called by the generated gRPC handler once to unmarshal the
 		// request body. We have the bytes already; this just decodes them.
 		dec := func(in interface{}) error {
@@ -91,6 +110,14 @@ func serverUnaryRequestHandler(srv interface{}, handler serverMethodHandler) una
 		}
 
 		response, err := handler(srv, ctx, dec, interceptor)
+
+		defer func() {
+			s.handleRPC(ctx, &stats.End{
+				BeginTime: beginTime,
+				EndTime:   time.Now(),
+				Error:     err,
+			})
+		}()
 
 		resp := &nrpc.Response{Type: &nrpc.Response_Unary{Unary: &nrpc.UnaryResponse{}}}
 		u := resp.GetUnary()
@@ -103,16 +130,22 @@ func serverUnaryRequestHandler(srv interface{}, handler serverMethodHandler) una
 			} else {
 				u.Data = payload
 				u.Status = status.Convert(nil).Proto()
+				s.handleRPC(ctx, &stats.OutPayload{
+					Payload:          response,
+					Length:           len(payload),
+					CompressedLength: len(payload),
+					SentTime:         time.Now(),
+				})
 			}
 		}
 
-		out, err := proto.Marshal(resp)
-		if err != nil {
-			s.log.Errorf("marshal unary response: %v", err)
+		out, marshalErr := proto.Marshal(resp)
+		if marshalErr != nil {
+			s.log.Errorf("marshal unary response: %v", marshalErr)
 			return
 		}
-		if err := msg.Respond(out); err != nil {
-			s.log.Errorf("respond unary: %v", err)
+		if respondErr := msg.Respond(out); respondErr != nil {
+			s.log.Errorf("respond unary: %v", respondErr)
 		}
 	}
 }
@@ -167,6 +200,7 @@ type Server struct {
 	services      map[string]*serviceInfo // service name -> service info
 	unaryInt      grpc.UnaryServerInterceptor
 	streamInt     grpc.StreamServerInterceptor
+	statsHandlers []stats.Handler
 }
 
 // NewServer creates a new Proxy
@@ -188,6 +222,36 @@ func WithUnaryServerInterceptor(interceptor grpc.UnaryServerInterceptor) ServerO
 func WithStreamServerInterceptor(interceptor grpc.StreamServerInterceptor) ServerOption {
 	return func(s *Server) {
 		s.streamInt = interceptor
+	}
+}
+
+// WithServerStatsHandler registers a stats.Handler with the server. Multiple
+// handlers may be registered; they are invoked in registration order at each
+// lifecycle event (TagRPC, Begin, InPayload, OutPayload, End), matching
+// grpc-go's behavior for repeated stats.Handler options.
+//
+// This is the integration point for libraries like otelgrpc — pass
+// otelgrpc.NewServerHandler() to get RPC-level traces and metrics without
+// pulling otelgrpc into pkg/rpc.
+func WithServerStatsHandler(h stats.Handler) ServerOption {
+	return func(s *Server) {
+		s.statsHandlers = append(s.statsHandlers, h)
+	}
+}
+
+// tagRPC fans TagRPC out across registered stats handlers. Each handler may
+// attach values to ctx; the cumulative ctx is returned for downstream use.
+func (s *Server) tagRPC(ctx context.Context, info *stats.RPCTagInfo) context.Context {
+	for _, h := range s.statsHandlers {
+		ctx = h.TagRPC(ctx, info)
+	}
+	return ctx
+}
+
+// handleRPC fans HandleRPC out across registered stats handlers.
+func (s *Server) handleRPC(ctx context.Context, rs stats.RPCStats) {
+	for _, h := range s.statsHandlers {
+		h.HandleRPC(ctx, rs)
 	}
 }
 
@@ -373,14 +437,29 @@ type serverStream struct {
 	method    string
 	reply     string
 	pnid      string
+
+	// Stats handler lifecycle. statsCtx is the ctx returned by TagRPC and
+	// becomes the parent for all subsequent HandleRPC calls. beginTime stamps
+	// the stats.Begin event; endErr captures the final error reported on
+	// stats.End. Begin/End fan-out is guarded by sync.Once so each stream
+	// produces exactly one Begin and one End — necessary because
+	// processCall/processData/processEnd run as separate goroutines and can
+	// race (see Server.onMessage's go-spawn dispatch).
+	beginTime  time.Time
+	endErr     error
+	statsCtx   context.Context
+	beginOnce  sync.Once
+	endOnce    sync.Once
+	statsBegun bool // set true inside beginOnce; read by statsEnd
 }
 
 func newServerStream(server *Server, method, reply string, log *logrus.Entry) *serverStream {
 	s := &serverStream{
-		server: server,
-		log:    log,
-		method: method,
-		reply:  reply,
+		server:   server,
+		log:      log,
+		method:   method,
+		reply:    reply,
+		statsCtx: server.ctx,
 	}
 	s.ctx, s.cancel = context.WithCancel(server.ctx)
 	recv := make(chan []byte, 1)
@@ -389,7 +468,41 @@ func newServerStream(server *Server, method, reply string, log *logrus.Entry) *s
 	return s
 }
 
+// statsBegin fires TagRPC + Begin exactly once for this stream. It is called
+// from any of processCall / processData / processEnd — whichever wins the
+// goroutine race — so that subsequent per-frame events (InPayload, OutPayload)
+// are always preceded by Begin.
+func (s *serverStream) statsBegin() {
+	s.beginOnce.Do(func() {
+		ctx := s.ctx
+		if s.md != nil {
+			ctx = metadata.NewIncomingContext(ctx, s.md)
+		}
+		ctx = s.server.tagRPC(ctx, &stats.RPCTagInfo{FullMethodName: s.method})
+		s.statsCtx = ctx
+		s.beginTime = time.Now()
+		s.server.handleRPC(ctx, &stats.Begin{BeginTime: s.beginTime})
+		s.statsBegun = true
+	})
+}
+
+// statsEnd fires End exactly once for this stream. Skipped if Begin never
+// fired (e.g., stream was created but received no traffic before shutdown).
+func (s *serverStream) statsEnd() {
+	if !s.statsBegun {
+		return
+	}
+	s.endOnce.Do(func() {
+		s.server.handleRPC(s.statsCtx, &stats.End{
+			BeginTime: s.beginTime,
+			EndTime:   time.Now(),
+			Error:     s.endErr,
+		})
+	})
+}
+
 func (s *serverStream) done() {
+	s.statsEnd()
 	s.cancel()
 	s.server.remove(s.reply)
 }
@@ -431,6 +544,7 @@ func (s *serverStream) processCall(call *nrpc.Call) {
 		}
 	}
 	s.pnid = call.Nid
+	s.statsBegin()
 	go handlerFunc(s)
 }
 
@@ -439,22 +553,34 @@ func (s *serverStream) processData(data *nrpc.Data) {
 		s.log.Error("data received after client closeSend")
 		return
 	}
+	// Defensive: Data can arrive before Call wins the goroutine race in
+	// Server.onMessage. statsBegin is idempotent (sync.Once) and ensures
+	// Begin always precedes InPayload in the emitted event stream.
+	s.statsBegin()
+	s.server.handleRPC(s.statsCtx, &stats.InPayload{
+		Length:           len(data.Data),
+		CompressedLength: len(data.Data),
+		RecvTime:         time.Now(),
+	})
 	s.recvWrite <- data.Data
 }
 
 func (s *serverStream) processEnd(end *nrpc.End) {
-	if end.Status != nil {
+	// Treat any non-OK status as a cancel; OK and nil status are normal
+	// half-close, in which case we just close the recv channel — RecvMsg
+	// will return io.EOF on the next read.
+	if end.Status != nil && end.Status.Code != int32(codes.OK) {
 		s.log.WithField("status", end.Status).Info("cancel")
+		s.endErr = status.ErrorProto(end.Status)
 		s.done()
-	} else {
-		s.muWrite.Lock()
-		defer s.muWrite.Unlock()
-		s.log.Info("closeSend")
-		if s.recvWrite != nil {
-			s.recvWrite <- nil
-			close(s.recvWrite)
-			s.recvWrite = nil
-		}
+		return
+	}
+	s.muWrite.Lock()
+	defer s.muWrite.Unlock()
+	s.log.Info("closeSend")
+	if s.recvWrite != nil {
+		close(s.recvWrite)
+		s.recvWrite = nil
 	}
 }
 
@@ -489,6 +615,7 @@ func (s *serverStream) onMessage(msg *nats.Msg) {
 }
 
 func (s *serverStream) close(err error) {
+	s.endErr = err
 	s.beginMaybe()
 	s.writeEnd(&nrpc.End{
 		Status:  status.Convert(err).Proto(),
@@ -547,6 +674,12 @@ func (s *serverStream) SendMsg(m interface{}) (err error) {
 	if err == nil {
 		data, err := proto.Marshal(m.(proto.Message))
 		if err == nil {
+			s.server.handleRPC(s.statsCtx, &stats.OutPayload{
+				Payload:          m,
+				Length:           len(data),
+				CompressedLength: len(data),
+				SentTime:         time.Now(),
+			})
 			s.writeData(&nrpc.Data{
 				Data: data,
 			})
