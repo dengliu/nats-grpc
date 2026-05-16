@@ -7,6 +7,7 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cloudwebrtc/nats-grpc/pkg/protos/nrpc"
@@ -305,10 +306,14 @@ func (c *Client) streamer(ctx context.Context, desc *grpc.StreamDesc, _ *grpc.Cl
 }
 
 type clientStream struct {
-	md            *metadata.MD
-	header        *metadata.MD
-	trailer       *metadata.MD
-	lastErr       error
+	md  *metadata.MD
+	header  *metadata.MD
+	trailer *metadata.MD
+	// lastErr captures the first transport-level error observed by ReadMsg.
+	// RecvMsg reads it after ctx.Done fires; ReadMsg and RecvMsg run on
+	// different goroutines, so the field must be guarded.
+	lastErrMu sync.Mutex
+	lastErr   error
 	ctx           context.Context
 	cancel        context.CancelFunc
 	log           *logrus.Logger
@@ -318,7 +323,7 @@ type clientStream struct {
 	reply         string
 	msgCh         chan *nats.Msg
 	sub           *nats.Subscription
-	closed        bool
+	closed        atomic.Bool
 	recvRead      <-chan []byte
 	recvWrite     chan []byte
 	hasBegun      bool
@@ -355,7 +360,6 @@ func newClientStream(ctx context.Context, client *Client, method, subj string, l
 		method:        method,
 		subject:       subj,
 		reply:         utils.NewInBox(),
-		closed:        false,
 		pingInterval:  5 * time.Second,
 		pongTimeout:   15 * time.Second,
 		lastPongTime:  time.Now(),
@@ -470,7 +474,7 @@ func (c *clientStream) ReadMsg() error {
 			if ok {
 				err := c.onMessage(msg)
 				if err != nil {
-					c.lastErr = err
+					c.setLastErr(err)
 					return err
 				}
 				break
@@ -481,8 +485,9 @@ func (c *clientStream) ReadMsg() error {
 }
 
 func (c *clientStream) done() error {
-	if !c.closed {
-		c.closed = true
+	// CompareAndSwap guarantees done()'s body runs at most once even when
+	// called concurrently from CloseSend, close(err), and processEnd.
+	if c.closed.CompareAndSwap(false, true) {
 		c.endOnce.Do(func() {
 			c.client.handleRPC(c.statsCtx, &stats.End{
 				Client:    true,
@@ -505,7 +510,7 @@ func (c *clientStream) done() error {
 }
 
 func (c *clientStream) SendMsg(m interface{}) error {
-	if c.closed {
+	if c.closed.Load() {
 		return fmt.Errorf("client streaming closed=true")
 	}
 
@@ -548,11 +553,25 @@ func (c *clientStream) SendMsg(m interface{}) error {
 	return c.writeData(data)
 }
 
+func (c *clientStream) setLastErr(err error) {
+	c.lastErrMu.Lock()
+	if c.lastErr == nil {
+		c.lastErr = err
+	}
+	c.lastErrMu.Unlock()
+}
+
+func (c *clientStream) getLastErr() error {
+	c.lastErrMu.Lock()
+	defer c.lastErrMu.Unlock()
+	return c.lastErr
+}
+
 func (c *clientStream) RecvMsg(m interface{}) error {
 	select {
 	case <-c.ctx.Done():
-		if c.lastErr != nil {
-			return c.lastErr
+		if err := c.getLastErr(); err != nil {
+			return err
 		}
 		// Convert context errors to gRPC status codes for proper metrics reporting
 		if c.ctx.Err() == context.DeadlineExceeded {
@@ -705,7 +724,7 @@ func (c *clientStream) pingLoop() {
 		case <-c.ctx.Done():
 			return
 		case <-ticker.C:
-			if c.closed {
+			if c.closed.Load() {
 				return
 			}
 			err := c.writePing(&nrpc.Ping{
