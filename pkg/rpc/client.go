@@ -495,7 +495,10 @@ func (c *clientStream) done() error {
 		close(c.heartbeatStop) // Stop heartbeat goroutines
 		err := c.sub.Unsubscribe()
 		close(c.msgCh)
-		c.client.remove(c.subject)
+		// Client.streams is keyed by reply (see Client.streamer); removing by
+		// subject silently no-ops and leaks the entry for the life of the
+		// process.
+		c.client.remove(c.reply)
 		return err
 	}
 	return errors.New("Client Streaming already closed")
