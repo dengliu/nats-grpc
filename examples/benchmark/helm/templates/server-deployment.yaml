@@ -1,4 +1,5 @@
 {{- if .Values.server.enabled }}
+{{- $ctx := . -}}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -10,7 +11,7 @@ metadata:
 spec:
   serviceName: {{ include "nats-grpc-benchmark.fullname" . }}-server
   podManagementPolicy: Parallel
-  replicas: {{ .Values.server.replicaCount }}
+  replicas: {{ include "nats-grpc-benchmark.scalar" (dict "ctx" $ctx "side" "server" "key" "replicaCount") }}
   selector:
     matchLabels:
       app: {{ include "nats-grpc-benchmark.name" . }}-server
@@ -48,9 +49,9 @@ spec:
         command: ["/app/benchmark-server"]
         args:
           - "--nats-url={{ .Values.nats.url }}"
-          - "--server-count={{ .Values.server.serverCount }}"
-          - "--nats-connections={{ .Values.server.natsConnections }}"
-          - "--payload-size={{ .Values.server.payloadSize }}"
+          - "--server-count={{ include "nats-grpc-benchmark.scalar" (dict "ctx" $ctx "side" "server" "key" "count") }}"
+          - "--nats-connections={{ include "nats-grpc-benchmark.scalar" (dict "ctx" $ctx "side" "server" "key" "natsConnections") }}"
+          - "--payload-size={{ include "nats-grpc-benchmark.scalar" (dict "ctx" $ctx "side" "server" "key" "payloadSize") }}"
           - "--metrics-port={{ .Values.server.metricsPort }}"
         env:
         - name: POD_NAME
@@ -62,7 +63,7 @@ spec:
           containerPort: {{ .Values.server.metricsPort }}
           protocol: TCP
         resources:
-          {{- toYaml .Values.server.resources | nindent 10 }}
+          {{- include "nats-grpc-benchmark.sideValue" (dict "ctx" $ctx "side" "server" "key" "resources") | nindent 10 }}
         livenessProbe:
           httpGet:
             path: /metrics

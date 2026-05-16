@@ -8,21 +8,29 @@ image:
 
 # NATS server connection
 nats:
-  url: "nats://nats.gke.internal:4222"
+  # url: "nats://nats.gke.internal:4222"
+  url: "nats://nats:4222"
 
-# Server configuration
-server:
-  enabled: true
-  replicaCount: 100
-  serverCount: 1000  # Number of servers per pod
-  # Number of NATS connections per pod, shared across all server goroutines
-  # via stripe assignment. NATS is goroutine-safe and multiplexes any number
-  # of subscriptions per conn; keeping this small avoids overwhelming the
-  # NATS cluster's connection table.
+# Common defaults shared by both server and client deployments. Any field
+# here can be overridden per-side by setting the same key under server: or
+# client: (e.g. server.replicaCount, client.natsConnections, ...).
+#
+# Use this block when you want symmetric scaling of the benchmark; only set
+# server.* / client.* values where the two sides truly differ.
+common:
+  # Number of pods per side (replicas of the server/client StatefulSet)
+  replicaCount: 50
+  # Number of server/client goroutines spawned inside each pod
+  # (passed as --server-count or --client-count to the binary)
+  count: 1000
+  # Number of NATS connections per pod, shared across all goroutines via
+  # stripe assignment. NATS is goroutine-safe and multiplexes any number
+  # of subscriptions / in-flight requests per conn; keeping this small
+  # avoids overwhelming the NATS cluster's connection table. Same value is
+  # used for both server pods (subscribers) and client pods (requesters).
   natsConnections: 4
+  # Payload size in bytes for both requests and responses
   payloadSize: 4096
-  metricsPort: 9090
-
   resources:
     limits:
       cpu: "4"
@@ -31,34 +39,23 @@ server:
       cpu: "4"
       memory: 16Gi
 
+# Server configuration (overrides for common, plus server-specific fields)
+server:
+  enabled: true
+  metricsPort: 9090
   service:
     type: ClusterIP
     metricsPort: 9090
 
-# Client configuration
+# Client configuration (overrides for common, plus client-specific fields)
 client:
   enabled: true
-  replicaCount: 100
-  clientCount: 1000  # Number of clients per pod
-  # Number of NATS connections per pod, shared across all client goroutines
-  # via stripe assignment. A single nats.Conn multiplexes thousands of
-  # in-flight nc.RequestWithContext calls via its shared inbox subscription.
-  natsConnections: 4
-  payloadSize: 4096
   metricsPort: 9091
   requestTimeout: 30  # gRPC request timeout in seconds
-
-  resources:
-    limits:
-      cpu: "4"
-      memory: 16Gi
-    requests:
-      cpu: "4"
-      memory: 16Gi
-
   service:
     type: ClusterIP
     metricsPort: 9091
+
 
 # ServiceMonitor for Prometheus Operator (optional)
 serviceMonitor:
