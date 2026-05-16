@@ -1,0 +1,74 @@
+syntax = "proto3";
+
+package sidecar;
+
+option go_package = "github.com/cloudwebrtc/nats-grpc/pkg/protos/sidecar";
+
+// SidecarAdmin lets a local app register itself with the sidecar's ingress
+// dispatcher. The svcid is determined dynamically at app startup (e.g. from
+// env / claim / tenant config), so registration cannot be expressed as
+// static sidecar config.
+//
+// Lease semantics: the Register stream IS the lease. Holding it open keeps
+// the registration alive; closing it (or crashing) deregisters everything
+// associated with the stream — including tearing down NATS subscriptions
+// and aborting in-flight ingress RPCs against the upstream.
+service SidecarAdmin {
+    // Register opens a long-lived bidi stream. The first client message
+    // must be Init; the server replies with Registered (containing the
+    // sidecar-assigned nid). The client may then send periodic
+    // Heartbeats for application-level liveness. Server-initiated
+    // teardown is not expressed in the protocol — drop the stream to
+    // deregister.
+    rpc Register(stream RegisterRequest) returns (stream RegisterResponse);
+}
+
+message RegisterRequest {
+    oneof type {
+        Init init = 1;
+        Heartbeat heartbeat = 2;
+    }
+}
+
+message Init {
+    // svcid is the load-balancing identity. Multiple replicas with the
+    // same svcid share queue-group load balancing on unary RPCs.
+    string svcid = 1;
+
+    // upstream is the local gRPC server address (host:port) the sidecar
+    // forwards incoming NATS calls to.
+    string upstream = 2;
+
+    // services are the fully-qualified proto service names the local app
+    // serves (e.g. "echo.Echo", "payments.PaymentService"). The sidecar
+    // opens one subscription per service.
+    repeated string services = 3;
+}
+
+message Heartbeat {
+    int64 client_timestamp_unix_nano = 1;
+}
+
+message RegisterResponse {
+    oneof type {
+        Registered registered = 1;
+        ErrorResponse error = 2;
+        HeartbeatAck heartbeat_ack = 3;
+    }
+}
+
+message Registered {
+    // nid is the sidecar-assigned per-replica identifier used as the
+    // <nid> segment of streaming subjects. The app should pass this to
+    // peers that need to target it specifically (e.g. via callers'
+    // x-nats-target-nid header).
+    string nid = 1;
+}
+
+message ErrorResponse {
+    string message = 1;
+}
+
+message HeartbeatAck {
+    int64 server_timestamp_unix_nano = 1;
+}
