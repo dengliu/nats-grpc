@@ -385,6 +385,8 @@ func (s *Server) onMessage(msg *nats.Msg) {
 	// Peek at the request to see if this is a single-shot unary RPC.
 	// Unary requests bypass the streaming machinery entirely so queue-group
 	// load balancing across replicas is safe (the whole RPC is one message).
+	// Unary calls are independent of each other, so spawning a goroutine per
+	// request is fine — and required to keep the NATS dispatcher unblocked.
 	request := &nrpc.Request{}
 	if err := proto.Unmarshal(msg.Data, request); err == nil {
 		if ureq, ok := request.Type.(*nrpc.Request_Unary); ok {
@@ -403,9 +405,14 @@ func (s *Server) onMessage(msg *nats.Msg) {
 		s.streams[msg.Reply] = stream
 	}
 	s.mu.Unlock()
-	// Already-unmarshaled request is re-parsed inside stream.onMessage to keep
-	// that code path unchanged; the extra Unmarshal cost only hits streaming.
-	go stream.onMessage(msg)
+
+	// Hand off to the stream's serialized worker. Per-stream serialization is
+	// required to preserve frame order: NATS delivers in order on a single
+	// subscription, but if we dispatched each frame in its own goroutine
+	// (the old behavior) Data frames could overtake the Call that initiated
+	// the stream, and End could race past in-flight Data and trigger
+	// `send on closed channel` in processData.
+	stream.enqueue(msg)
 }
 
 func (s *Server) remove(reply string) {
@@ -438,6 +445,12 @@ type serverStream struct {
 	reply     string
 	pnid      string
 
+	// inbox is the per-stream queue of inbound NATS frames. A single worker
+	// goroutine (started in newServerStream) drains it and dispatches frames
+	// synchronously to processCall/Data/End/Ping, preserving the order NATS
+	// delivered them in.
+	inbox chan *nats.Msg
+
 	// Stats handler lifecycle. statsCtx is the ctx returned by TagRPC and
 	// becomes the parent for all subsequent HandleRPC calls. beginTime stamps
 	// the stats.Begin event; endErr captures the final error reported on
@@ -460,12 +473,46 @@ func newServerStream(server *Server, method, reply string, log *logrus.Entry) *s
 		method:   method,
 		reply:    reply,
 		statsCtx: server.ctx,
+		inbox:    make(chan *nats.Msg, 8192),
 	}
 	s.ctx, s.cancel = context.WithCancel(server.ctx)
 	recv := make(chan []byte, 1)
 	s.recvRead = recv
 	s.recvWrite = recv
+	go s.runInbox()
 	return s
+}
+
+// enqueue hands a frame to the per-stream worker. Frames are processed in
+// the order NATS delivered them.
+func (s *serverStream) enqueue(msg *nats.Msg) {
+	select {
+	case <-s.ctx.Done():
+		// Stream is shutting down; drop the frame.
+	case s.inbox <- msg:
+	}
+}
+
+// runInbox is the per-stream serialized worker. It unmarshals each frame and
+// dispatches synchronously, guaranteeing that Call precedes Data precedes End
+// for a given stream.
+func (s *serverStream) runInbox() {
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case msg, ok := <-s.inbox:
+			if !ok {
+				return
+			}
+			request := &nrpc.Request{}
+			if err := proto.Unmarshal(msg.Data, request); err != nil {
+				s.log.WithField("data", string(msg.Data)).Error("unknown message")
+				continue
+			}
+			s.onRequest(msg, request)
+		}
+	}
 }
 
 // statsBegin fires TagRPC + Begin exactly once for this stream. It is called
@@ -602,16 +649,6 @@ func (s *serverStream) beginMaybe() error {
 		}
 	}
 	return nil
-}
-
-func (s *serverStream) onMessage(msg *nats.Msg) {
-	request := &nrpc.Request{}
-	err := proto.Unmarshal(msg.Data, request)
-	if err != nil {
-		s.log.WithField("data", string(msg.Data)).Error("unknown message")
-	}
-
-	go s.onRequest(msg, request)
 }
 
 func (s *serverStream) close(err error) {
