@@ -33,7 +33,8 @@ type serverTransportStream struct {
 }
 
 func (s *serverTransportStream) Method() string {
-	return s.stream.method
+	// Mirror serverStream.Method — return the canonical gRPC method path.
+	return s.stream.Method()
 }
 func (s *serverTransportStream) SetHeader(md metadata.MD) error {
 	return s.stream.SetHeader(md)
@@ -152,10 +153,16 @@ func serverUnaryRequestHandler(srv interface{}, handler serverMethodHandler) una
 
 func serverStreamHandler(srv interface{}, handler grpc.StreamHandler) handlerFunc {
 	return func(s *serverStream) {
+		// Attach a transport stream so grpc.MethodFromServerStream — used by
+		// proxy/handler.go and interceptor code — sees the canonical gRPC
+		// method path. Store on a separate field instead of mutating s.ctx,
+		// which is read by the inbox goroutine and would race.
+		s.handlerCtx = grpc.NewContextWithServerTransportStream(s.ctx, &serverTransportStream{stream: s})
+
 		// If stream interceptor is set, use it
 		if s.server.streamInt != nil {
 			info := &grpc.StreamServerInfo{
-				FullMethod:     s.method,
+				FullMethod:     s.fullMethod,
 				IsClientStream: true, // conservative assumption
 				IsServerStream: true,
 			}
@@ -459,15 +466,28 @@ type serverStream struct {
 	md        metadata.MD // recevied metadata from client
 	header    metadata.MD // send header to client
 	trailer   metadata.MD // send trialer to client
-	method    string
-	reply     string
-	pnid      string
+	// method is the NATS subject (e.g. `nrpc.<nid>.pkg.Service.Method`).
+	// Used for handler-map lookup and logs.
+	method string
+	// fullMethod is the canonical gRPC method path (e.g.
+	// `/pkg.Service/Method`). Populated from Call.Method; falls back to
+	// method until Call arrives. Used for stats.RPCTagInfo and Method().
+	fullMethod string
+	reply      string
+	pnid       string
 
 	// inbox is the per-stream queue of inbound NATS frames. A single worker
 	// goroutine (started in newServerStream) drains it and dispatches frames
 	// synchronously to processCall/Data/End/Ping, preserving the order NATS
 	// delivered them in.
 	inbox chan *nats.Msg
+
+	// handlerCtx is the context delivered to the user's gRPC handler. It
+	// derives from ctx and carries a serverTransportStream so
+	// grpc.MethodFromServerStream resolves to the canonical method path.
+	// Written exactly once just before invoking the handler; read only
+	// from the handler's goroutine via Context().
+	handlerCtx context.Context
 
 	// Stats handler lifecycle. statsCtx is the ctx returned by TagRPC and
 	// becomes the parent for all subsequent HandleRPC calls. beginTime stamps
@@ -486,12 +506,13 @@ type serverStream struct {
 
 func newServerStream(server *Server, method, reply string, log *logrus.Entry) *serverStream {
 	s := &serverStream{
-		server:   server,
-		log:      log,
-		method:   method,
-		reply:    reply,
-		statsCtx: server.ctx,
-		inbox:    make(chan *nats.Msg, 8192),
+		server:     server,
+		log:        log,
+		method:     method,
+		fullMethod: method, // overwritten when Call arrives
+		reply:      reply,
+		statsCtx:   server.ctx,
+		inbox:      make(chan *nats.Msg, 8192),
 	}
 	s.ctx, s.cancel = context.WithCancel(server.ctx)
 	recv := make(chan []byte, 1)
@@ -534,16 +555,15 @@ func (s *serverStream) runInbox() {
 }
 
 // statsBegin fires TagRPC + Begin exactly once for this stream. It is called
-// from any of processCall / processData / processEnd — whichever wins the
-// goroutine race — so that subsequent per-frame events (InPayload, OutPayload)
-// are always preceded by Begin.
+// from processCall (after Call.Method has populated fullMethod) so stats
+// handlers see the canonical gRPC method path rather than the NATS subject.
 func (s *serverStream) statsBegin() {
 	s.beginOnce.Do(func() {
 		ctx := s.ctx
 		if s.md != nil {
 			ctx = metadata.NewIncomingContext(ctx, s.md)
 		}
-		ctx = s.server.tagRPC(ctx, &stats.RPCTagInfo{FullMethodName: s.method})
+		ctx = s.server.tagRPC(ctx, &stats.RPCTagInfo{FullMethodName: s.fullMethod})
 		s.statsCtx = ctx
 		s.beginTime = time.Now()
 		s.server.handleRPC(ctx, &stats.Begin{BeginTime: s.beginTime})
@@ -594,6 +614,13 @@ func (s *serverStream) onRequest(msg *nats.Msg, request *nrpc.Request) {
 }
 
 func (s *serverStream) processCall(call *nrpc.Call) {
+	// Call.Method is the canonical gRPC path; capture it for stats /
+	// Method(). Older clients that sent the subject in Method are still
+	// accepted — if it doesn't start with '/' we leave fullMethod as the
+	// subject (the default set in newServerStream).
+	if call.Method != "" && call.Method[0] == '/' {
+		s.fullMethod = call.Method
+	}
 	s.log = s.log.WithField("method", s.method)
 	handlerFunc, ok := s.server.handlers[s.method]
 	if !ok {
@@ -687,7 +714,10 @@ func (s *serverStream) close(err error) {
 // Server Stream interface
 //
 func (s *serverStream) Method() string {
-	return s.method
+	// Return the canonical gRPC method path. grpc.MethodFromServerStream
+	// (used by proxy/handler.go and downstream interceptor code) expects
+	// `/pkg.Service/Method`, not the NATS subject.
+	return s.fullMethod
 }
 
 func (s *serverStream) SetHeader(header metadata.MD) error {
@@ -719,6 +749,14 @@ func (s *serverStream) SetTrailer(trailer metadata.MD) {
 }
 
 func (s *serverStream) Context() context.Context {
+	// Prefer the handler-scoped context (carries the transport stream) when
+	// available so grpc.MethodFromServerStream / interceptor code see the
+	// gRPC method path. Falls back to the bare ctx for callers that touch
+	// Context() before the handler is dispatched (none currently, but
+	// keeping the fallback avoids a nil deref if that ordering changes).
+	if s.handlerCtx != nil {
+		return s.handlerCtx
+	}
 	return s.ctx
 }
 

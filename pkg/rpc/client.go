@@ -540,7 +540,12 @@ func (c *clientStream) SendMsg(m interface{}) error {
 	if !c.hasBegun {
 		c.hasBegun = true
 		call := &nrpc.Call{
-			Method: c.subject,
+			// Carry the canonical gRPC method path (e.g.
+			// `/pkg.Service/Method`) so the server can tag stats
+			// handlers consistently with the unary fast path. The NATS
+			// subject is already on msg.Subject if anything downstream
+			// needs it.
+			Method: c.method,
 			Nid:    c.client.nid,
 		}
 		if c.md != nil {

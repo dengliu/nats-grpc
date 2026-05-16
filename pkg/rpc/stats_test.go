@@ -287,8 +287,11 @@ func TestStats_Streaming_Lifecycle(t *testing.T) {
 	if assert.Len(t, clientH.tags, 1) {
 		assert.Equal(t, "/echo.Echo/Echo", clientH.tags[0].FullMethodName)
 	}
+	// Server-side now also receives the canonical gRPC method path (carried
+	// in Call.Method) instead of the NATS subject — matching the unary
+	// fast path and what otelgrpc / interceptors expect.
 	if assert.Len(t, serverH.tags, 1) {
-		assert.Equal(t, "nrpc.svc-stream.echo.Echo.Echo", serverH.tags[0].FullMethodName)
+		assert.Equal(t, "/echo.Echo/Echo", serverH.tags[0].FullMethodName)
 	}
 }
 
