@@ -238,46 +238,69 @@ func (c *Client) invoker(ctx context.Context, method string, args interface{}, r
 		return rpcErr
 	}
 
-	// Populate optional header/trailer call options.
+	// Populate optional header/trailer call options. grpc-go's contract is
+	// to overwrite *HeaderAddr / *TrailerAddr with a fresh metadata.MD —
+	// not to append into whatever the caller previously stored — so a
+	// reused &md doesn't accumulate duplicate keys across calls.
 	for _, o := range opts {
 		switch o := o.(type) {
 		case grpc.HeaderCallOption:
-			if u.Header != nil && o.HeaderAddr != nil {
-				if *o.HeaderAddr == nil {
-					*o.HeaderAddr = metadata.MD{}
+			if o.HeaderAddr != nil {
+				md := metadata.MD{}
+				if u.Header != nil {
+					for hdr, data := range u.Header.Md {
+						md.Append(hdr, data.Values...)
+					}
 				}
-				for hdr, data := range u.Header.Md {
-					o.HeaderAddr.Append(hdr, data.Values...)
-				}
+				*o.HeaderAddr = md
 			}
 		case grpc.TrailerCallOption:
-			if u.Trailer != nil && o.TrailerAddr != nil {
-				if *o.TrailerAddr == nil {
-					*o.TrailerAddr = metadata.MD{}
+			if o.TrailerAddr != nil {
+				md := metadata.MD{}
+				if u.Trailer != nil {
+					for hdr, data := range u.Trailer.Md {
+						md.Append(hdr, data.Values...)
+					}
 				}
-				for hdr, data := range u.Trailer.Md {
-					o.TrailerAddr.Append(hdr, data.Values...)
-				}
+				*o.TrailerAddr = md
 			}
 		}
 	}
 
-	if u.Status != nil && u.Status.Code != int32(codes.OK) {
+	// Unmarshal the body before checking status, so we can emit InPayload
+	// with the deserialized message — matching grpc-go's stats ordering
+	// (bytes → InPayload(Payload=deserialized) → return). Skip unmarshal
+	// when the server reported an error: by protocol the data field is
+	// empty in that case, but if a future server packs error details into
+	// Data we'd otherwise overwrite the reply with garbage.
+	statusOK := u.Status == nil || u.Status.Code == int32(codes.OK)
+	if statusOK && len(u.Data) > 0 {
+		if err := proto.Unmarshal(u.Data, reply.(proto.Message)); err != nil {
+			rpcErr = err
+			return err
+		}
+	}
+
+	// Fire InPayload whenever bytes were on the wire — including non-OK
+	// responses that happen to carry payload. Length reports the raw
+	// wire size; Payload is the deserialized message when available.
+	if len(u.Data) > 0 {
+		ev := &stats.InPayload{
+			Client:           true,
+			Length:           len(u.Data),
+			CompressedLength: len(u.Data),
+			RecvTime:         time.Now(),
+		}
+		if statusOK {
+			ev.Payload = reply
+		}
+		c.handleRPC(ctx, ev)
+	}
+
+	if !statusOK {
 		rpcErr = status.ErrorProto(u.Status)
 		return rpcErr
 	}
-
-	if err := proto.Unmarshal(u.Data, reply.(proto.Message)); err != nil {
-		rpcErr = err
-		return err
-	}
-	c.handleRPC(ctx, &stats.InPayload{
-		Client:           true,
-		Payload:          reply,
-		Length:           len(u.Data),
-		CompressedLength: len(u.Data),
-		RecvTime:         time.Now(),
-	})
 	return nil
 }
 
