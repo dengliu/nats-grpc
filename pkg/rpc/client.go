@@ -23,6 +23,12 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// Heartbeat defaults preserved from the original implementation.
+const (
+	defaultPingInterval = 5 * time.Second
+	defaultPongTimeout  = 15 * time.Second
+)
+
 type Client struct {
 	nc            NatsConn
 	ctx           context.Context
@@ -35,6 +41,13 @@ type Client struct {
 	unaryInt      grpc.UnaryClientInterceptor
 	streamInt     grpc.StreamClientInterceptor
 	statsHandlers []stats.Handler
+
+	// pingInterval and pongTimeout apply to every new streaming RPC. A
+	// pingInterval of 0 disables the heartbeat entirely (no ping/pong
+	// goroutines spawned per stream); useful for very high stream
+	// fan-out where the goroutine overhead dwarfs the liveness benefit.
+	pingInterval time.Duration
+	pongTimeout  time.Duration
 }
 
 func NewClient(nc NatsConn, svcid string, nid string) *Client {
@@ -56,6 +69,32 @@ func WithStreamInterceptor(interceptor grpc.StreamClientInterceptor) ClientOptio
 	return func(c *Client) {
 		c.streamInt = interceptor
 	}
+}
+
+// WithHeartbeat configures the per-stream Ping/Pong cadence for streaming
+// RPCs. interval is how often the client sends a Ping; timeout is how long
+// the client waits for any Pong before declaring the server dead and
+// closing the stream with codes.Unavailable.
+//
+// Constraints:
+//   - timeout must be > interval — otherwise a single dropped pong races
+//     the very next ping and the stream tears itself down.
+//   - interval == 0 disables the heartbeat entirely. The pingLoop /
+//     pongMonitor goroutines are not started, so streams rely solely on
+//     the underlying ctx deadline / NATS connection loss to detect death.
+//
+// Defaults: 5s interval, 15s timeout (preserving prior behavior).
+func WithHeartbeat(interval, timeout time.Duration) ClientOption {
+	return func(c *Client) {
+		c.pingInterval = interval
+		c.pongTimeout = timeout
+	}
+}
+
+// WithoutHeartbeat disables the streaming heartbeat. Equivalent to
+// WithHeartbeat(0, 0).
+func WithoutHeartbeat() ClientOption {
+	return WithHeartbeat(0, 0)
 }
 
 // WithStatsHandler registers a stats.Handler with the client. Multiple
@@ -90,11 +129,13 @@ func (c *Client) handleRPC(ctx context.Context, s stats.RPCStats) {
 
 func NewClientWithOptions(nc NatsConn, svcid string, nid string, opts ...ClientOption) *Client {
 	c := &Client{
-		nc:      nc,
-		svcid:   svcid,
-		nid:     nid,
-		streams: make(map[string]*clientStream),
-		log:     log.NewLoggerWithFields(log.DebugLevel, "nats-grpc.Client", log.Fields{"svc-id": svcid, "self-nid": nid}),
+		nc:           nc,
+		svcid:        svcid,
+		nid:          nid,
+		streams:      make(map[string]*clientStream),
+		log:          log.NewLoggerWithFields(log.DebugLevel, "nats-grpc.Client", log.Fields{"svc-id": svcid, "self-nid": nid}),
+		pingInterval: defaultPingInterval,
+		pongTimeout:  defaultPongTimeout,
 	}
 	c.ctx, c.cancel = context.WithCancel(context.Background())
 	
@@ -106,19 +147,28 @@ func NewClientWithOptions(nc NatsConn, svcid string, nid string, opts ...ClientO
 	return c
 }
 
-// Close gracefully stops a Client
+// Close gracefully stops a Client. Snapshot the streams under the mutex,
+// then release it before calling st.done() — done() walks the same map
+// (via Client.remove keyed by stream.reply) and would otherwise deadlock
+// against this Close-held mutex.
 func (p *Client) Close() error {
 	p.cancel()
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	for name, st := range p.streams {
-		err := st.done()
-		if err != nil {
+	snapshot := make(map[string]*clientStream, len(p.streams))
+	for k, v := range p.streams {
+		snapshot[k] = v
+	}
+	p.mu.Unlock()
+	var firstErr error
+	for name, st := range snapshot {
+		if err := st.done(); err != nil {
 			p.log.Errorf("Unsubscribe [%v] failed %v", name, err)
-			return err
+			if firstErr == nil {
+				firstErr = err
+			}
 		}
 	}
-	return nil
+	return firstErr
 }
 
 func (p *Client) CloseStream(nid string) bool {
@@ -383,8 +433,8 @@ func newClientStream(ctx context.Context, client *Client, method, subj string, l
 		method:        method,
 		subject:       subj,
 		reply:         utils.NewInBox(),
-		pingInterval:  5 * time.Second,
-		pongTimeout:   15 * time.Second,
+		pingInterval:  client.pingInterval,
+		pongTimeout:   client.pongTimeout,
 		lastPongTime:  time.Now(),
 		heartbeatStop: make(chan struct{}),
 		beginTime:     begin,
@@ -424,8 +474,14 @@ func newClientStream(ctx context.Context, client *Client, method, subj string, l
 	}
 
 	go stream.ReadMsg()
-	go stream.pingLoop()
-	go stream.pongMonitor()
+	// Skip the heartbeat goroutines entirely when configured off
+	// (pingInterval <= 0). This is the documented WithoutHeartbeat /
+	// WithHeartbeat(0, 0) path — no goroutines, no per-stream ticker, no
+	// per-tick allocation.
+	if stream.pingInterval > 0 {
+		go stream.pingLoop()
+		go stream.pongMonitor()
+	}
 	return stream
 }
 
