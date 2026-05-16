@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -196,6 +195,20 @@ func (c *Client) Invoke(ctx context.Context, method string, args interface{}, re
 	return c.invoker(ctx, method, args, reply, nil, opts...)
 }
 
+// InvokeWithSvcID is the sidecar-oriented unary entry point. Unlike Invoke,
+// it routes through the modern subject namespace (nrpc.unary.<svcid>.…) and
+// takes svcid per call rather than from constructor state. Used by the
+// sidecar's egress dispatcher where each inbound gRPC call carries its own
+// svcid in metadata. The client's constructor-time svcid is ignored on
+// this path.
+func (c *Client) InvokeWithSvcID(ctx context.Context, svcid, method string, args interface{}, reply interface{}, opts ...grpc.CallOption) error {
+	if svcid == "" {
+		return status.Error(codes.InvalidArgument, "svcid is required")
+	}
+	subj := modernUnarySubject(svcid, method)
+	return c.invokeOnSubject(ctx, subj, method, args, reply, opts...)
+}
+
 // invoker is the actual RPC invocation logic for unary RPCs.
 //
 // Unary calls use NATS request/reply (a single message in, single message out)
@@ -209,6 +222,15 @@ func (c *Client) Invoke(ctx context.Context, method string, args interface{}, re
 //
 // End fires exactly once with the final error (or nil on success).
 func (c *Client) invoker(ctx context.Context, method string, args interface{}, reply interface{}, _ *grpc.ClientConn, opts ...grpc.CallOption) error {
+	return c.invokeOnSubject(ctx, legacySubject(c.svcid, method), method, args, reply, opts...)
+}
+
+// invokeOnSubject is the wire-level unary invocation. The subject is
+// supplied by the caller so legacy (Client.svcid-based) and modern
+// (per-call svcid) entry points share the same stats / metadata /
+// marshal / error-mapping plumbing. method is the canonical gRPC path
+// — used for stats and as UnaryRequest.Method.
+func (c *Client) invokeOnSubject(ctx context.Context, subj, method string, args interface{}, reply interface{}, opts ...grpc.CallOption) error {
 	ctx = c.tagRPC(ctx, &stats.RPCTagInfo{FullMethodName: method})
 	beginTime := time.Now()
 	c.handleRPC(ctx, &stats.Begin{Client: true, BeginTime: beginTime, FailFast: true})
@@ -223,16 +245,21 @@ func (c *Client) invoker(ctx context.Context, method string, args interface{}, r
 		})
 	}()
 
-	prefix := "nrpc"
-	if len(c.svcid) > 0 {
-		prefix = fmt.Sprintf("nrpc.%v", c.svcid)
-	}
-	subj := prefix + strings.ReplaceAll(method, "/", ".")
-
-	payload, err := proto.Marshal(args.(proto.Message))
-	if err != nil {
-		rpcErr = err
-		return err
+	// Allow *Frame as a raw-bytes pass-through (the sidecar dispatches
+	// every method generically and doesn't have schema-aware proto
+	// objects). For ordinary proto.Message args we marshal as before.
+	var (
+		payload []byte
+		err     error
+	)
+	if f, ok := args.(*Frame); ok {
+		payload = f.Payload
+	} else {
+		payload, err = proto.Marshal(args.(proto.Message))
+		if err != nil {
+			rpcErr = err
+			return err
+		}
 	}
 	c.handleRPC(ctx, &stats.OutPayload{
 		Client:           true,
@@ -325,7 +352,11 @@ func (c *Client) invoker(ctx context.Context, method string, args interface{}, r
 	// Data we'd otherwise overwrite the reply with garbage.
 	statusOK := u.Status == nil || u.Status.Code == int32(codes.OK)
 	if statusOK && len(u.Data) > 0 {
-		if err := proto.Unmarshal(u.Data, reply.(proto.Message)); err != nil {
+		// Sidecar pass-through: hand the raw bytes to a *Frame reply
+		// instead of trying to proto-unmarshal them.
+		if f, ok := reply.(*Frame); ok {
+			f.Payload = append(f.Payload[:0], u.Data...)
+		} else if err := proto.Unmarshal(u.Data, reply.(proto.Message)); err != nil {
 			rpcErr = err
 			return err
 		}
@@ -366,16 +397,34 @@ func (c *Client) NewStream(ctx context.Context, desc *grpc.StreamDesc, method st
 
 // streamer is the actual stream creation logic
 func (c *Client) streamer(ctx context.Context, desc *grpc.StreamDesc, _ *grpc.ClientConn, method string, opts ...grpc.CallOption) (grpc.ClientStream, error) {
-	prefix := "nrpc"
-	if len(c.svcid) > 0 {
-		prefix = fmt.Sprintf("nrpc.%v", c.svcid)
-	}
-	subj := prefix + strings.ReplaceAll(method, "/", ".")
+	return c.streamOnSubject(ctx, legacySubject(c.svcid, method), method, opts...)
+}
+
+// streamOnSubject opens a streaming RPC on the given pre-built NATS
+// subject. Shared between the legacy streamer and the sidecar-oriented
+// NewStreamWithSvcID so both share clientStream lifecycle handling.
+func (c *Client) streamOnSubject(ctx context.Context, subj, method string, opts ...grpc.CallOption) (grpc.ClientStream, error) {
 	stream := newClientStream(ctx, c, method, subj, c.log, opts...)
 	c.mu.Lock()
 	c.streams[stream.reply] = stream
 	c.mu.Unlock()
 	return stream, nil
+}
+
+// NewStreamWithSvcID is the sidecar-oriented streaming entry point. Uses
+// the modern subject namespace (nrpc.stream.<svcid>.<targetNid>.…) and
+// takes svcid + targetNid per call. targetNid pins the entire stream to a
+// specific server replica — required for streaming correctness, since
+// stream frames must all land on the same replica to preserve state.
+func (c *Client) NewStreamWithSvcID(ctx context.Context, svcid, targetNid string, desc *grpc.StreamDesc, method string, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+	if svcid == "" {
+		return nil, status.Error(codes.InvalidArgument, "svcid is required")
+	}
+	if targetNid == "" {
+		return nil, status.Error(codes.InvalidArgument, "targetNid is required for streaming")
+	}
+	subj := modernStreamSubject(svcid, targetNid, method)
+	return c.streamOnSubject(ctx, subj, method, opts...)
 }
 
 type clientStream struct {
@@ -482,6 +531,16 @@ func newClientStream(ctx context.Context, client *Client, method, subj string, l
 		go stream.pingLoop()
 		go stream.pongMonitor()
 	}
+	// Universal teardown trigger. CloseSend is a half-close (just End{OK}
+	// on the wire — it leaves recv open), so it cannot be the trigger for
+	// cleanup; otherwise the response side dies the moment the caller
+	// stops sending. Watch ctx instead: when the user's ctx is cancelled
+	// (timeout, cancel(), or a parent ctx ending) we fire done() to
+	// unsubscribe, fire stats.End, and remove from Client.streams.
+	go func() {
+		<-stream.ctx.Done()
+		_ = stream.done()
+	}()
 	return stream
 }
 
@@ -500,11 +559,18 @@ func (c *clientStream) Trailer() metadata.MD {
 }
 
 func (c *clientStream) CloseSend() error {
+	// CloseSend is a HALF-close — the caller is done sending but the
+	// server may still send responses. Previously this also called
+	// done() which tore down the subscription and cancelled ctx,
+	// breaking response delivery (any future RecvMsg returned
+	// Canceled). The wire protocol already supports half-close via
+	// End{OK}: the server's processEnd treats OK status as "close recv
+	// only", non-OK as full cancel. Full close happens via Recv → EOF
+	// (server-initiated End), context cancel, or explicit close(err).
 	c.log.Info("Client CloseSend")
-	c.writeEnd(&nrpc.End{
+	return c.writeEnd(&nrpc.End{
 		Status: status.Convert(nil).Proto(),
 	})
-	return c.done()
 }
 
 func (c *clientStream) close(err error) {
@@ -782,8 +848,12 @@ func (c *clientStream) processEnd(end *nrpc.End) error {
 	}
 
 	// Non-OK status from the server is a real cancel/error close. OK status
-	// (or nil) is the normal server half-close — closing the recv channel
-	// signals EOF to RecvMsg without a phantom empty-message frame.
+	// (or nil) is the normal server-complete close — both indicate the
+	// server is done sending and the stream is finished from the
+	// caller's perspective. Either way we run done() to fire stats.End
+	// and tear down the subscription. grpc-go's HTTP/2 transport
+	// behaves the same way: server-side trailers (success or not) end
+	// the stream and fire stats.End on the client.
 	if end.Status != nil && end.Status.Code != int32(codes.OK) {
 		c.log.WithField("status", end.Status).Info("cancel")
 		c.endErr = status.ErrorProto(end.Status)
@@ -791,8 +861,14 @@ func (c *clientStream) processEnd(end *nrpc.End) error {
 		return status.Error(codes.Code(end.Status.Code), end.Status.GetMessage())
 	}
 	c.log.Info("Server CloseSend")
-	close(c.recvWrite)
-	c.recvWrite = nil
+	if c.recvWrite != nil {
+		close(c.recvWrite)
+		c.recvWrite = nil
+	}
+	// Server-side completion: terminal for the stream. Done() is
+	// idempotent (CompareAndSwap on closed), so the ctx-watcher's
+	// later call is a no-op.
+	c.done()
 	return nil
 }
 

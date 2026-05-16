@@ -79,17 +79,26 @@ func TestIntegration_SetHeaderAfterSend_ReturnsErrIllegalHeaderWrite(t *testing.
 // nilHeaderEchoSrv intentionally never calls SetHeader. Before the fix,
 // beginMaybe skipped writing the Begin frame in this case — so the client
 // never learned the server's nid, leaving point-to-point heartbeat routing
-// without its target.
+// without its target. It also blocks after one send so the test can
+// inspect client state before the stream is torn down.
 type nilHeaderEchoSrv struct {
 	echo.UnimplementedEchoServer
+	release chan struct{}
 }
 
-func (nilHeaderEchoSrv) Echo(stream echo.Echo_EchoServer) error {
+func (s nilHeaderEchoSrv) Echo(stream echo.Echo_EchoServer) error {
 	_, err := stream.Recv()
 	if err != nil && err != io.EOF {
 		return err
 	}
-	return stream.Send(&echo.EchoReply{Msg: "ok"})
+	if err := stream.Send(&echo.EchoReply{Msg: "ok"}); err != nil {
+		return err
+	}
+	// Hold the stream open so the client-side inspection runs before
+	// server-End{OK} fires the client's done() and drains the streams
+	// map.
+	<-s.release
+	return nil
 }
 
 // TestIntegration_BeginAlwaysSentSoClientLearnsServerNid asserts the client
@@ -104,7 +113,8 @@ func TestIntegration_BeginAlwaysSentSoClientLearnsServerNid(t *testing.T) {
 	defer scn.Close()
 	const serverNid = "server-nid-7"
 	srv := NewServer(scn, serverNid)
-	echo.RegisterEchoServer(srv, nilHeaderEchoSrv{})
+	impl := nilHeaderEchoSrv{release: make(chan struct{})}
+	echo.RegisterEchoServer(srv, impl)
 	t.Cleanup(srv.Stop)
 
 	ccn, err := nats.Connect(url)
@@ -121,7 +131,8 @@ func TestIntegration_BeginAlwaysSentSoClientLearnsServerNid(t *testing.T) {
 	_, err = stream.Recv()
 	require.NoError(t, err)
 
-	// Reach into Client.streams to find this stream and inspect pnid.
+	// Server is parked inside Echo — the stream is still live in the
+	// client's map, so this is the window to check pnid.
 	rawClient.mu.Lock()
 	var found bool
 	for _, st := range rawClient.streams {
@@ -133,6 +144,6 @@ func TestIntegration_BeginAlwaysSentSoClientLearnsServerNid(t *testing.T) {
 	rawClient.mu.Unlock()
 	assert.True(t, found, "client never received Begin.Nid; pnid was never populated")
 
-	// Cleanup.
+	close(impl.release)
 	_ = stream.CloseSend()
 }
