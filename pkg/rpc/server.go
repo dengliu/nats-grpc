@@ -323,10 +323,49 @@ func (s *Server) CloseStream(nid string) error {
 	return nil
 }
 
-// RegisterService is used to register gRPC services
+// validateStreamingNid returns a warning string (or "") if registering
+// service sd on a server with the given nid would put streaming RPCs at
+// risk of cross-replica fan-out. Factored out as a pure function so tests
+// can pin the behavior without scraping log output.
+//
+// The rule: a service with any streaming methods requires a non-empty nid.
+// Empty nid means the server subject and queue group are shared across all
+// replicas — fine for the single-message unary fast path, fatal for
+// multi-message streaming.
+func validateStreamingNid(sd *grpc.ServiceDesc, nid string) string {
+	if len(sd.Streams) == 0 || nid != "" {
+		return ""
+	}
+	return fmt.Sprintf(
+		"RegisterService(%q): streaming methods registered with an empty nid — "+
+			"if you run more than one replica with this configuration, streaming RPCs "+
+			"will fan out across replicas via the NATS queue group and corrupt stream "+
+			"state. Pass a unique nid per replica to NewServer / NewServerWithOptions.",
+		sd.ServiceName,
+	)
+}
+
+// RegisterService is used to register gRPC services.
+//
+// Safety constraint for streaming RPCs: when a service has any client/server
+// streaming methods, the server's nid MUST be unique per replica.
+// Streaming spans multiple NATS frames (Call/Data/End/Ping) that must all
+// land on the same replica to preserve stream state; if two replicas share
+// nid, the queue group on the subject will fan stream frames out across
+// them and silently corrupt state. The unary fast path
+// (UnaryRequest/UnaryResponse) is single-message and safe to queue-fan-out
+// — it's the streaming protocol that requires point-to-point addressing.
+//
+// We can't refuse the registration outright (this would break existing
+// callers that use an empty nid for unary-only services), so when streaming
+// is present without a unique-by-construction nid the server logs a loud
+// warning. Tests pin the log so a future refactor can't silently demote it.
 func (s *Server) RegisterService(sd *grpc.ServiceDesc, ss interface{}) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if w := validateStreamingNid(sd, s.nid); w != "" {
+		s.log.Warn(w)
+	}
 	prefix := fmt.Sprintf("nrpc.%v", sd.ServiceName)
 	if len(s.nid) > 0 {
 		prefix = fmt.Sprintf("nrpc.%v.%v", s.nid, sd.ServiceName)
