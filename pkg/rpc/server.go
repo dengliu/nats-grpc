@@ -660,16 +660,18 @@ func (s *serverStream) processPing(ping *nrpc.Ping) {
 }
 
 func (s *serverStream) beginMaybe() error {
-	if !s.hasBegun {
-		s.hasBegun = true
-		if s.header != nil {
-			return s.writeBegin(&nrpc.Begin{
-				Header: utils.MakeMetadata(s.header),
-				Nid:    s.server.nid,
-			})
-		}
+	if s.hasBegun {
+		return nil
 	}
-	return nil
+	s.hasBegun = true
+	// Always send Begin once per stream — even when no headers were set.
+	// The client uses Begin.Nid to learn which replica owns the stream
+	// (heartbeat routing depends on it). Skipping Begin when headers are
+	// nil left the client without that signal.
+	return s.writeBegin(&nrpc.Begin{
+		Header: utils.MakeMetadata(s.header),
+		Nid:    s.server.nid,
+	})
 }
 
 func (s *serverStream) close(err error) {
