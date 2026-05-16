@@ -277,8 +277,26 @@ func NewServerWithOptions(nc NatsConn, nid string, opts ...ServerOption) *Server
 	return s
 }
 
-// Stop gracefully stops a Proxy
+// Stop gracefully stops the server. All in-flight streams are torn down
+// with a stats.End event so observability backends don't see orphaned
+// long-running spans/metrics, and NATS subscriptions are unsubscribed.
 func (s *Server) Stop() {
+	// Snapshot the streams under the mutex; done() mutates the same map.
+	s.mu.Lock()
+	streams := make([]*serverStream, 0, len(s.streams))
+	for _, st := range s.streams {
+		streams = append(streams, st)
+	}
+	s.mu.Unlock()
+	stopErr := status.Error(codes.Unavailable, "server stopping")
+	for _, st := range streams {
+		// finalize is endOnce-guarded so it's safe to race with the stream's
+		// own close paths (handler completion, processEnd error). The first
+		// finalize call wins; later ones no-op. No wire End is written here —
+		// the connection may already be torn down.
+		st.finalize(stopErr)
+	}
+
 	s.cancel()
 	for name, sub := range s.subs {
 		err := sub.Unsubscribe()
@@ -533,25 +551,29 @@ func (s *serverStream) statsBegin() {
 	})
 }
 
-// statsEnd fires End exactly once for this stream. Skipped if Begin never
-// fired (e.g., stream was created but received no traffic before shutdown).
-func (s *serverStream) statsEnd() {
-	if !s.statsBegun {
-		return
-	}
+// finalize tears the stream down exactly once. It is the single writer of
+// endErr and the single emitter of stats.End — both are guarded by endOnce so
+// concurrent close paths (handler completion, processEnd's error path, and
+// Server.Stop) cannot race the field or double-fire the event.
+func (s *serverStream) finalize(err error) {
 	s.endOnce.Do(func() {
-		s.server.handleRPC(s.statsCtx, &stats.End{
-			BeginTime: s.beginTime,
-			EndTime:   time.Now(),
-			Error:     s.endErr,
-		})
+		s.endErr = err
+		if s.statsBegun {
+			s.server.handleRPC(s.statsCtx, &stats.End{
+				BeginTime: s.beginTime,
+				EndTime:   time.Now(),
+				Error:     err,
+			})
+		}
 	})
-}
-
-func (s *serverStream) done() {
-	s.statsEnd()
 	s.cancel()
 	s.server.remove(s.reply)
+}
+
+// done is retained for callers that already populated endErr (legacy path).
+// Prefer finalize(err) — it eliminates the racy write of endErr.
+func (s *serverStream) done() {
+	s.finalize(s.endErr)
 }
 
 func (s *serverStream) onRequest(msg *nats.Msg, request *nrpc.Request) {
@@ -618,8 +640,7 @@ func (s *serverStream) processEnd(end *nrpc.End) {
 	// will return io.EOF on the next read.
 	if end.Status != nil && end.Status.Code != int32(codes.OK) {
 		s.log.WithField("status", end.Status).Info("cancel")
-		s.endErr = status.ErrorProto(end.Status)
-		s.done()
+		s.finalize(status.ErrorProto(end.Status))
 		return
 	}
 	s.muWrite.Lock()
@@ -652,13 +673,12 @@ func (s *serverStream) beginMaybe() error {
 }
 
 func (s *serverStream) close(err error) {
-	s.endErr = err
 	s.beginMaybe()
 	s.writeEnd(&nrpc.End{
 		Status:  status.Convert(err).Proto(),
 		Trailer: utils.MakeMetadata(s.trailer),
 	})
-	s.done()
+	s.finalize(err)
 }
 
 //
