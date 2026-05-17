@@ -492,6 +492,25 @@ func (s *SidecarAdminServer) Register(stream pb.SidecarAdmin_RegisterServer) err
 }
 ```
 
+### HTTP/JSON alternative
+
+For non-Go callers, requiring them to run `protoc` against
+`sidecar.proto` to register is friction that undercuts the polyglot
+pitch. The sidecar therefore exposes a second admin endpoint with
+identical semantics — `POST /v1/register` on a separate loopback
+port (default `127.0.0.1:50101`). Same lease model (the open HTTP
+connection IS the lease), same `openIngress` machinery under the
+hood, same teardown-on-disconnect behaviour. Pre-generated stubs and
+protoc invocations are no longer required for Python, Node, Ruby,
+or anyone else.
+
+The two admin paths coexist; a fleet can mix Go services registering
+via gRPC with Python services registering via HTTP without either
+side knowing the other exists.
+
+See [`cmd/nats-grpc-sidecar/README.md`](cmd/nats-grpc-sidecar/README.md)
+for the wire format, Python example, and curl invocation.
+
 ### Re-registration / mid-flight changes
 
 For v1 the registration is fixed for the lifetime of the admin stream —

@@ -42,10 +42,11 @@ func runEmbeddedNATS(t *testing.T) string {
 func startSidecar(t *testing.T, natsURL, nid string) *Sidecar {
 	t.Helper()
 	sc := New(Config{
-		NATSURL:    natsURL,
-		EgressAddr: "127.0.0.1:0",
-		AdminAddr:  "127.0.0.1:0",
-		Nid:        nid,
+		NATSURL:       natsURL,
+		EgressAddr:    "127.0.0.1:0",
+		AdminAddr:     "127.0.0.1:0",
+		HTTPAdminAddr: "127.0.0.1:0",
+		Nid:           nid,
 	})
 	require.NoError(t, sc.Start(context.Background()))
 	t.Cleanup(func() { _ = sc.Close() })

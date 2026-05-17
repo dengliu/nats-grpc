@@ -10,16 +10,21 @@ This README is the operator's reference for the binary itself.
 
 ## What it does
 
-Two loopback gRPC ports, plus one outbound NATS connection:
+Three loopback ports, plus one outbound NATS connection:
 
 | Port (default) | Purpose |
 |---|---|
-| `127.0.0.1:50051` | **Egress.** The local app dials this to make outbound RPCs. Each call must carry routing metadata (see [Reserved headers](#reserved-headers)). |
-| `127.0.0.1:50100` | **Admin.** The local app calls `SidecarAdmin.Register` on this port at boot to declare which gRPC services it serves and under which svcid. |
+| `127.0.0.1:50051` | **Egress** (gRPC). The local app dials this to make outbound RPCs. Each call must carry routing metadata (see [Reserved headers](#reserved-headers)). |
+| `127.0.0.1:50100` | **Admin** (gRPC). Local apps that already use gRPC can register via the typed `SidecarAdmin.Register` stream. |
+| `127.0.0.1:50101` | **HTTP admin** (JSON). `POST /v1/register` opens a registration without any nats-grpc proto code-gen — meant for Python / Node / any language where running `protoc` against `sidecar.proto` is friction. The open HTTP connection is the lease, identical semantics to the gRPC admin. |
 
 Routing is **per-call, metadata-driven**. The caller stamps `x-nats-svcid`
 onto each call; the sidecar uses that as the NATS routing key. There is
 no static `service→svcid` config file.
+
+Both admin paths share the same `openIngress` machinery under the hood, so
+a fleet can mix and match — some Go services register via gRPC, some
+Python services register via HTTP, all are served identically.
 
 ## Building
 
@@ -52,10 +57,12 @@ docker build --platform linux/amd64 \
 ## Flags
 
 ```
--nats     string  NATS server URL (default "nats://localhost:4222")
--egress   string  egress gRPC listen addr (default "127.0.0.1:50051")
--admin    string  admin gRPC listen addr (default "127.0.0.1:50100")
--nid      string  sidecar nid (default: auto-generated, "sc-<random hex>")
+-nats         string  NATS server URL (default "nats://localhost:4222")
+-egress       string  egress gRPC listen addr (default "127.0.0.1:50051")
+-admin        string  gRPC admin listen addr (default "127.0.0.1:50100")
+-http-admin   string  HTTP/JSON admin listen addr (default "127.0.0.1:50101";
+                      pass "-" to disable)
+-nid          string  sidecar nid (default: auto-generated, "sc-<random hex>")
 ```
 
 Defaults bind to loopback because the intended deployment is a Kubernetes
@@ -65,6 +72,89 @@ process-pair or bare-metal deployments where the app is in a different
 network namespace, override `-egress` / `-admin` with a non-loopback
 address — and front it with TLS or a firewall, because the admin port
 has no authentication.
+
+## HTTP/JSON registration (polyglot)
+
+For services not written in Go, the simplest way to register is the
+HTTP admin. No proto codegen, no nats-grpc dependency — just a long-
+lived `POST` to `/v1/register`.
+
+**Wire format**:
+
+```
+POST /v1/register HTTP/1.1
+Content-Type: application/json
+
+{
+  "svcid": "<dynamic, decided at app startup>",
+  "upstream": "<host:port of the local gRPC server>",
+  "services": ["pkg.Service1", "pkg.Service2"]
+}
+```
+
+Response is `200 OK` with `Content-Type: application/x-ndjson`. The
+first line carries the sidecar's nid; subsequent lines are periodic
+keepalive acks every 30 seconds:
+
+```
+{"nid":"sc-abc123"}
+{"ack":1738000000000000000}
+{"ack":1738000030000000000}
+...
+```
+
+**The lease is the open HTTP connection.** When the client (or the
+network) drops it, the sidecar deregisters automatically. Don't reuse
+HTTP/2 connection pools for this call — keep the request itself
+open.
+
+Validation failures (missing `svcid`, bad JSON, wrong method, unknown
+fields) return `4xx` with a JSON `{"error":"..."}` body before any
+state is touched.
+
+**Python example**:
+
+```python
+import json, requests, threading
+
+def register_with_sidecar(svcid, upstream, services):
+    resp = requests.post(
+        "http://127.0.0.1:50101/v1/register",
+        json={"svcid": svcid, "upstream": upstream, "services": services},
+        stream=True,  # don't buffer the body — we want NDJSON lines
+        timeout=None,
+    )
+    resp.raise_for_status()
+    lines = resp.iter_lines()
+    initial = json.loads(next(lines))
+    print(f"registered, sidecar nid = {initial['nid']}")
+    # Hold the connection. Acks come every 30s; the loop exits when
+    # the connection drops (which is what we want — the sidecar is
+    # already tearing us down).
+    for line in lines:
+        if not line:
+            continue
+        # ignore ack bodies, or use them to detect dead sidecars
+
+# Run in a background thread so the app's gRPC server can do real work.
+threading.Thread(
+    target=register_with_sidecar,
+    args=("serviceid_1", "127.0.0.1:8080", ["echo.Echo"]),
+    daemon=True,
+).start()
+```
+
+**curl** to verify the endpoint at a glance:
+
+```sh
+curl -N -X POST \
+  -H "Content-Type: application/json" \
+  -d '{"svcid":"foo","upstream":"127.0.0.1:8080","services":["pkg.X"]}' \
+  http://127.0.0.1:50101/v1/register
+```
+
+`-N` is important — without it curl buffers the body and you won't see
+the streamed NDJSON lines.
 
 ## Reserved headers
 

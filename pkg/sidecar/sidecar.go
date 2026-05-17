@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"sync"
 
 	rpc "github.com/cloudwebrtc/nats-grpc/pkg/rpc"
@@ -43,6 +44,13 @@ type Config struct {
 	// SidecarAdmin.Register. Default: 127.0.0.1:50100.
 	AdminAddr string
 
+	// HTTPAdminAddr is the loopback HTTP/JSON admin address — a polyglot
+	// alternative to AdminAddr for languages where running protoc against
+	// sidecar.proto is friction (Python, Node, …). POST /v1/register
+	// with a JSON body opens a registration; the open connection is the
+	// lease. Default: 127.0.0.1:50101. Set to "-" to disable.
+	HTTPAdminAddr string
+
 	// Nid identifies this sidecar instance. It becomes the <nid> segment
 	// of streaming subjects the sidecar subscribes to on behalf of
 	// registered apps, so peers targeting "this replica" via
@@ -57,10 +65,12 @@ type Sidecar struct {
 	nc  *nats.Conn
 	cli *rpc.Client // shared nrpc client used by the egress path
 
-	egressLis   net.Listener
-	adminLis    net.Listener
-	egressSrv   *grpc.Server
-	adminSrv    *grpc.Server
+	egressLis    net.Listener
+	adminLis     net.Listener
+	httpAdminLis net.Listener
+	egressSrv    *grpc.Server
+	adminSrv     *grpc.Server
+	httpAdminSrv *http.Server
 
 	// registrations tracks live admin sessions. Keyed by an opaque
 	// session ID; each entry owns its NATS subscriptions and an upstream
@@ -87,6 +97,9 @@ func New(cfg Config) *Sidecar {
 	}
 	if cfg.AdminAddr == "" {
 		cfg.AdminAddr = "127.0.0.1:50100"
+	}
+	if cfg.HTTPAdminAddr == "" {
+		cfg.HTTPAdminAddr = "127.0.0.1:50101"
 	}
 	if cfg.Nid == "" {
 		cfg.Nid = randomNid()
@@ -131,13 +144,32 @@ func (s *Sidecar) Start(ctx context.Context) error {
 	go func() { _ = s.egressSrv.Serve(s.egressLis) }()
 	go func() { _ = s.adminSrv.Serve(s.adminLis) }()
 
+	// HTTPAdminAddr == "-" disables the HTTP admin entirely. Useful in
+	// tests that want to be sure no rogue port is bound, or in
+	// constrained envs where one admin path is enough.
+	if s.cfg.HTTPAdminAddr != "-" {
+		if err := s.startHTTPAdmin(); err != nil {
+			_ = s.adminLis.Close()
+			_ = s.egressLis.Close()
+			s.nc.Close()
+			return err
+		}
+	}
+
 	return nil
 }
 
-// EgressAddr / AdminAddr return the bound listener addresses, useful when
-// the config specified port 0 (let-OS-pick).
+// EgressAddr / AdminAddr / HTTPAdminAddr return the bound listener
+// addresses, useful when the config specified port 0 (let-OS-pick).
+// HTTPAdminAddr returns "" if the HTTP admin was disabled.
 func (s *Sidecar) EgressAddr() string { return s.egressLis.Addr().String() }
 func (s *Sidecar) AdminAddr() string  { return s.adminLis.Addr().String() }
+func (s *Sidecar) HTTPAdminAddr() string {
+	if s.httpAdminLis == nil {
+		return ""
+	}
+	return s.httpAdminLis.Addr().String()
+}
 
 // Nid returns the sidecar's nid (auto-generated or from Config).
 func (s *Sidecar) Nid() string { return s.cfg.Nid }
@@ -163,6 +195,13 @@ func (s *Sidecar) Close() error {
 	}
 	if s.adminSrv != nil {
 		s.adminSrv.GracefulStop()
+	}
+	if s.httpAdminSrv != nil {
+		// Close, not Shutdown — Shutdown waits for all open
+		// connections to drain, but our registration connections
+		// are by design long-lived. close(s.done) above signals the
+		// per-request loops to bail; Close yanks the listener.
+		_ = s.httpAdminSrv.Close()
 	}
 	if s.cli != nil {
 		_ = s.cli.Close()
