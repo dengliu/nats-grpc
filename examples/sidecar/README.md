@@ -62,28 +62,30 @@ next to it for container builds.
 
 ## Running it
 
-You'll need five terminals. The roles are: NATS, the two sidecars, the
-two backends, and the client. (You can collapse to one sidecar + two
-backends if you want — see "Single-sidecar mode" below.)
+You'll need five terminals. The roles are: NATS, two sidecars, two
+backends, and the client. One sidecar would technically suffice for
+the egress side, but two separate sidecars more closely mirror a
+Kubernetes deployment where each pod runs its own.
 
 ```sh
 # Terminal 1 — NATS
 nats-server
 
-# Terminal 2 — sidecar 1 (will host the serviceid_1 ingress registration,
-#                          and is also where the client sends egress traffic)
-go run ./cmd/nats-grpc-sidecar -egress 127.0.0.1:50051 -admin 127.0.0.1:50100 -nats nats://localhost:4222
+# Terminal 2 — sidecar 1 (egress for the client; ingress for backend A)
+go run ./cmd/nats-grpc-sidecar \
+  -egress 127.0.0.1:50051 -http-admin 127.0.0.1:50101 \
+  -nats nats://localhost:4222
 
-# Terminal 3 — sidecar 2 (hosts the serviceid_2 ingress registration; a
-#                          separate admin port so the two backends don't
-#                          collide on registration)
-go run ./cmd/nats-grpc-sidecar -egress 127.0.0.1:50052 -admin 127.0.0.1:50200 -nats nats://localhost:4222
+# Terminal 3 — sidecar 2 (ingress for backend B)
+go run ./cmd/nats-grpc-sidecar \
+  -egress 127.0.0.1:50052 -http-admin 127.0.0.1:50201 \
+  -nats nats://localhost:4222
 
 # Terminal 4 — backend A (registers as serviceid_1 against sidecar 1)
-go run ./examples/sidecar/server -svcid serviceid_1 -admin 127.0.0.1:50100
+go run ./examples/sidecar/server -svcid serviceid_1 -admin http://127.0.0.1:50101/v1/register
 
 # Terminal 5 — backend B (registers as serviceid_2 against sidecar 2)
-go run ./examples/sidecar/server -svcid serviceid_2 -admin 127.0.0.1:50200
+go run ./examples/sidecar/server -svcid serviceid_2 -admin http://127.0.0.1:50201/v1/register
 
 # Terminal 6 — client (dials sidecar 1's egress port)
 go run ./examples/sidecar/client -egress 127.0.0.1:50051
@@ -99,14 +101,20 @@ Expected client output:
 The client made two calls through the same stub; the routing was
 decided entirely by the `x-nats-svcid` value attached to each call's
 context. Neither backend knows about NATS — they're plain `echo.Echo`
-servers.
+servers, and registration is plain HTTP/JSON (no nats-grpc
+dependency).
+
+In a backend's terminal you'll also see periodic heartbeat acks like
+`heartbeat ack ts=1716000000000000000` every 30 seconds. The open
+HTTP connection to the sidecar IS the registration lease; closing
+the terminal drops the connection and the sidecar deregisters
+automatically.
 
 ### Single-sidecar mode
 
-A single sidecar instance can serve both ingress registrations on one
-admin port if you give them distinct local listen ports for the
-backends. In that variant, drop terminal 3 and point both backend
-processes at the same `-admin 127.0.0.1:50100`.
+A single sidecar instance can serve both ingress registrations
+because the HTTP admin allows multiple concurrent POSTs. Drop
+terminal 3 and point both backends at `http://127.0.0.1:50101/v1/register`.
 
 ## The polyglot story — grpcurl
 

@@ -1,14 +1,18 @@
 // Package sidecar implements a language-agnostic bridge between standard
 // gRPC and the nats-grpc protocol. See SIDECAR.md for the design.
 //
-// The local app speaks vanilla gRPC to two loopback ports:
-//   - Egress (default 127.0.0.1:50051): outbound RPCs go here. Each call
-//     must include the x-nats-svcid metadata header naming the target
-//     backend svcid. For streaming RPCs add x-nats-mode: streaming and
-//     x-nats-target-nid: <replica>.
-//   - Admin  (default 127.0.0.1:50100): the local app registers its
-//     ingress (svcid + service list + upstream gRPC addr) here at
-//     startup via the SidecarAdmin.Register bidi stream.
+// The local app speaks vanilla gRPC to one loopback port and HTTP to
+// another:
+//   - Egress (default 127.0.0.1:50051, gRPC): outbound RPCs go here.
+//     Each call must include the x-nats-svcid metadata header naming
+//     the target backend svcid. For streaming RPCs add
+//     x-nats-mode: streaming and x-nats-target-nid: <replica>.
+//   - Admin  (default 127.0.0.1:50101, HTTP/JSON): the local app
+//     registers its ingress (svcid + service list + upstream gRPC
+//     addr) here at startup by POSTing to /v1/register. The open
+//     HTTP connection is the lease; closing it deregisters. No
+//     codegen required, so Python / Node / Ruby / any language with
+//     an HTTP client can register without depending on nats-grpc.
 //
 // Everything else — discovery, retries, auth — is out of scope for v1.
 package sidecar
@@ -40,15 +44,12 @@ type Config struct {
 	// EgressAddr is the loopback gRPC address the local app dials for
 	// outbound RPCs. Default: 127.0.0.1:50051.
 	EgressAddr string
-	// AdminAddr is the loopback gRPC address the local app uses to call
-	// SidecarAdmin.Register. Default: 127.0.0.1:50100.
-	AdminAddr string
 
-	// HTTPAdminAddr is the loopback HTTP/JSON admin address — a polyglot
-	// alternative to AdminAddr for languages where running protoc against
-	// sidecar.proto is friction (Python, Node, …). POST /v1/register
-	// with a JSON body opens a registration; the open connection is the
-	// lease. Default: 127.0.0.1:50101. Set to "-" to disable.
+	// HTTPAdminAddr is the loopback HTTP/JSON admin address. POST
+	// /v1/register with a JSON body opens a registration; the open
+	// connection is the lease. Default: 127.0.0.1:50101. Set to "-"
+	// to disable (registrations become impossible — only useful for
+	// tests that exercise the egress side in isolation).
 	HTTPAdminAddr string
 
 	// Nid identifies this sidecar instance. It becomes the <nid> segment
@@ -66,10 +67,8 @@ type Sidecar struct {
 	cli *rpc.Client // shared nrpc client used by the egress path
 
 	egressLis    net.Listener
-	adminLis     net.Listener
 	httpAdminLis net.Listener
 	egressSrv    *grpc.Server
-	adminSrv     *grpc.Server
 	httpAdminSrv *http.Server
 
 	// registrations tracks live admin sessions. Keyed by an opaque
@@ -85,7 +84,7 @@ type Sidecar struct {
 	streams   map[string]*streamWorker
 
 	// done is closed when the sidecar shuts down. Used by the admin
-	// stream-loop and ingress dispatchers to bail out.
+	// request loop and ingress dispatchers to bail out.
 	done chan struct{}
 }
 
@@ -94,9 +93,6 @@ type Sidecar struct {
 func New(cfg Config) *Sidecar {
 	if cfg.EgressAddr == "" {
 		cfg.EgressAddr = "127.0.0.1:50051"
-	}
-	if cfg.AdminAddr == "" {
-		cfg.AdminAddr = "127.0.0.1:50100"
 	}
 	if cfg.HTTPAdminAddr == "" {
 		cfg.HTTPAdminAddr = "127.0.0.1:50101"
@@ -112,9 +108,9 @@ func New(cfg Config) *Sidecar {
 	}
 }
 
-// Start opens the NATS connection and both gRPC listeners. The returned
-// errors come from listener / NATS setup; per-call failures surface to
-// the local app as gRPC status errors.
+// Start opens the NATS connection and the listeners. The returned errors
+// come from listener / NATS setup; per-call failures surface to the
+// local app as gRPC status errors or HTTP 4xx/5xx.
 func (s *Sidecar) Start(ctx context.Context) error {
 	if s.cfg.NATSURL == "" {
 		return errors.New("sidecar: NATSURL is required")
@@ -132,24 +128,15 @@ func (s *Sidecar) Start(ctx context.Context) error {
 		s.nc.Close()
 		return fmt.Errorf("sidecar: listen egress: %w", err)
 	}
-	if s.adminLis, err = net.Listen("tcp", s.cfg.AdminAddr); err != nil {
-		_ = s.egressLis.Close()
-		s.nc.Close()
-		return fmt.Errorf("sidecar: listen admin: %w", err)
-	}
 
 	s.egressSrv = newEgressServer(s)
-	s.adminSrv = newAdminServer(s)
-
 	go func() { _ = s.egressSrv.Serve(s.egressLis) }()
-	go func() { _ = s.adminSrv.Serve(s.adminLis) }()
 
 	// HTTPAdminAddr == "-" disables the HTTP admin entirely. Useful in
-	// tests that want to be sure no rogue port is bound, or in
-	// constrained envs where one admin path is enough.
+	// tests that exercise the egress side without needing registration,
+	// or in constrained envs where one fewer bound port matters.
 	if s.cfg.HTTPAdminAddr != "-" {
 		if err := s.startHTTPAdmin(); err != nil {
-			_ = s.adminLis.Close()
 			_ = s.egressLis.Close()
 			s.nc.Close()
 			return err
@@ -159,11 +146,10 @@ func (s *Sidecar) Start(ctx context.Context) error {
 	return nil
 }
 
-// EgressAddr / AdminAddr / HTTPAdminAddr return the bound listener
-// addresses, useful when the config specified port 0 (let-OS-pick).
+// EgressAddr / HTTPAdminAddr return the bound listener addresses,
+// useful when the config specified port 0 (let-OS-pick).
 // HTTPAdminAddr returns "" if the HTTP admin was disabled.
 func (s *Sidecar) EgressAddr() string { return s.egressLis.Addr().String() }
-func (s *Sidecar) AdminAddr() string  { return s.adminLis.Addr().String() }
 func (s *Sidecar) HTTPAdminAddr() string {
 	if s.httpAdminLis == nil {
 		return ""
@@ -192,9 +178,6 @@ func (s *Sidecar) Close() error {
 
 	if s.egressSrv != nil {
 		s.egressSrv.GracefulStop()
-	}
-	if s.adminSrv != nil {
-		s.adminSrv.GracefulStop()
 	}
 	if s.httpAdminSrv != nil {
 		// Close, not Shutdown — Shutdown waits for all open

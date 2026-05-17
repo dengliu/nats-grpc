@@ -366,48 +366,32 @@ inherits it for free.
 
 ## 5. Ingress (NATS → local app)
 
-### 5.1 Registration via admin API
+### 5.1 Registration via HTTP/JSON admin
 
-Because svcid is determined at app startup, the sidecar cannot pre-subscribe
-to NATS subjects. The app tells the sidecar what to subscribe to via an
-admin gRPC service:
+Because svcid is determined at app startup, the sidecar cannot
+pre-subscribe to NATS subjects. The app tells the sidecar what to
+subscribe to by POSTing JSON to a loopback HTTP endpoint:
 
-```protobuf
-service SidecarAdmin {
-    // Register adds NATS subscriptions for the given (svcid, services).
-    // The connection is the lease — when it closes, all subscriptions
-    // registered through it are removed.
-    rpc Register(stream RegisterRequest) returns (stream RegisterResponse);
+```
+POST /v1/register HTTP/1.1
+Content-Type: application/json
+
+{
+  "svcid":    "<dynamic, decided at app startup>",
+  "upstream": "<host:port of local gRPC server>",
+  "services": ["pkg.Service1", "pkg.Service2"]
 }
+```
 
-message RegisterRequest {
-    oneof type {
-        Init init = 1;
-        Heartbeat heartbeat = 2;
-    }
-}
+The response is `200 OK` with `Content-Type: application/x-ndjson`.
+First line carries the sidecar's nid; subsequent lines are periodic
+keepalive acks:
 
-message Init {
-    string svcid = 1;               // dynamic, decided at app startup
-    string upstream = 2;            // local gRPC server addr, e.g. "127.0.0.1:8080"
-    repeated string services = 3;   // proto service names, e.g. ["pkg.Greeter"]
-}
-
-message Heartbeat {}
-
-message RegisterResponse {
-    oneof type {
-        Registered registered = 1;
-        Error error = 2;
-    }
-}
-
-message Registered {
-    string nid = 1;  // sidecar-assigned, unique per replica; surfaced
-                     // so the app can advertise it elsewhere if useful
-}
-
-message Error { string message = 1; }
+```
+{"nid":"sc-abc123"}
+{"ack":1716000000000000000}
+{"ack":1716000030000000000}
+...
 ```
 
 App-side flow:
@@ -415,17 +399,18 @@ App-side flow:
 ```
 1. App boots, decides svcid (from env, tenant claim, whatever).
 2. App starts its gRPC server on :8080.
-3. App opens a streaming RPC to the sidecar admin: Register({svcid, services, upstream}).
-4. Sidecar opens NATS subscriptions, replies with Registered{nid}.
-5. App keeps the stream alive (periodic Heartbeat or just hold-open).
-6. When the app exits, the stream closes; sidecar tears down the
+3. App POSTs to http://127.0.0.1:50101/v1/register with the JSON above.
+4. Sidecar opens NATS subscriptions, sends Registered{nid}.
+5. App holds the HTTP connection open. Acks arrive every ~30s.
+6. When the app exits, the connection closes; sidecar tears down the
    subscriptions automatically.
 ```
 
-`Register` is intentionally a bidi stream and not a unary call so the
-sidecar can detect app death via the closed stream rather than relying on
-liveness probes or unregister-on-shutdown — which would be missed on hard
-crashes.
+HTTP rather than gRPC for registration is a deliberate polyglot
+choice: any language with an HTTP client can register without
+running `protoc` against a sidecar proto or depending on
+nats-grpc. See `examples/sidecar/python/` for the Python flow and
+`cmd/nats-grpc-sidecar/README.md` for the full wire format.
 
 ### 5.2 NATS subscription set
 
@@ -462,63 +447,60 @@ forwarded into the upstream gRPC call's outgoing context, minus the
 
 ## 6. Sidecar admin: implementation shape
 
-The admin service runs on a separate loopback port (default 50100) with
-**no authentication** — same trust model as the egress loopback. It exposes
-only `Register`; deregistration is implicit on stream close.
+The admin service runs on a separate loopback port (default 50101)
+with **no authentication** — same trust model as the egress loopback.
+It exposes one route, `POST /v1/register`; deregistration is implicit
+on connection close.
 
 ```go
-type SidecarAdminServer struct {
-    sc *Sidecar
-}
+func (s *Sidecar) handleHTTPRegister(w http.ResponseWriter, r *http.Request) {
+    if r.Method != http.MethodPost {
+        writeHTTPError(w, http.StatusMethodNotAllowed, "use POST")
+        return
+    }
+    var req httpRegisterRequest
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil { /* 400 */ }
+    // (validation: svcid/upstream/services required)
 
-func (s *SidecarAdminServer) Register(stream pb.SidecarAdmin_RegisterServer) error {
-    req, err := stream.Recv()
-    if err != nil { return err }
-    init := req.GetInit()
-    if init == nil { return status.Error(codes.InvalidArgument, "first message must be Init") }
+    reg, err := s.openIngress(req.Svcid, req.Upstream, req.Services)
+    if err != nil { /* 502 */ }
+    defer s.closeIngress(reg)
 
-    nid, teardown, err := s.sc.openIngress(init.Svcid, init.Upstream, init.Services)
-    if err != nil { return err }
-    defer teardown()
+    w.Header().Set("Content-Type", "application/x-ndjson")
+    w.WriteHeader(http.StatusOK)
+    writeJSONLine(w, map[string]any{"nid": s.cfg.Nid})
+    w.(http.Flusher).Flush()
 
-    if err := stream.Send(&pb.RegisterResponse{
-        Type: &pb.RegisterResponse_Registered{Registered: &pb.Registered{Nid: nid}},
-    }); err != nil { return err }
-
-    // Hold the stream open; exit on app disconnect.
+    // Hold the connection. Acks keep middleboxes happy and surface
+    // dead clients via failed writes. Exit on r.Context().Done()
+    // (client disconnect) or sidecar shutdown.
+    ticker := time.NewTicker(httpAdminKeepaliveInterval)
+    defer ticker.Stop()
     for {
-        if _, err := stream.Recv(); err != nil { return nil }
+        select {
+        case <-r.Context().Done():  return
+        case <-s.done:              return
+        case <-ticker.C:
+            if err := writeJSONLine(w, map[string]any{"ack": time.Now().UnixNano()}); err != nil { return }
+            w.(http.Flusher).Flush()
+        }
     }
 }
 ```
 
-### HTTP/JSON alternative
-
-For non-Go callers, requiring them to run `protoc` against
-`sidecar.proto` to register is friction that undercuts the polyglot
-pitch. The sidecar therefore exposes a second admin endpoint with
-identical semantics — `POST /v1/register` on a separate loopback
-port (default `127.0.0.1:50101`). Same lease model (the open HTTP
-connection IS the lease), same `openIngress` machinery under the
-hood, same teardown-on-disconnect behaviour. Pre-generated stubs and
-protoc invocations are no longer required for Python, Node, Ruby,
-or anyone else.
-
-The two admin paths coexist; a fleet can mix Go services registering
-via gRPC with Python services registering via HTTP without either
-side knowing the other exists.
-
-See [`cmd/nats-grpc-sidecar/README.md`](cmd/nats-grpc-sidecar/README.md)
-for the wire format, Python example, and curl invocation.
+The long-lived HTTP request IS the lease. Standard HTTP semantics
+already give us "client died → connection dropped → server learns
+about it" without any extra liveness protocol — same property the
+gRPC streaming approach would have provided.
 
 ### Re-registration / mid-flight changes
 
-For v1 the registration is fixed for the lifetime of the admin stream —
-to change svcid or service list, the app drops the stream and registers
-again. This matches the stated requirement ("determined at runtime when
-the application starts"). If we later need hot reconfiguration without
-dropping the admin stream, add a `Reconfigure` variant to the stream's
-`oneof`.
+For v1 the registration is fixed for the lifetime of the HTTP
+request — to change svcid or service list, the app closes the
+connection and POSTs again. This matches the stated requirement
+("determined at runtime when the application starts"). If we later
+need hot reconfiguration without dropping the connection, the
+endpoint can grow a `PATCH /v1/register/{id}` variant.
 
 ---
 

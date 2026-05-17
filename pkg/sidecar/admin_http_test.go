@@ -191,9 +191,8 @@ func TestHTTPAdmin_Validation(t *testing.T) {
 func TestHTTPAdmin_AcceptsLazyUpstream(t *testing.T) {
 	// grpc.NewClient doesn't dial until a call is made, so even an
 	// obviously bad upstream string succeeds at registration time.
-	// We document this — the call-time failure is exercised
-	// elsewhere via the no-backend scenario in
-	// TestAdmin_AppDeathDeregisters.
+	// We document this — call-time failures are exercised elsewhere
+	// (see TestEndToEnd_AppDeathDeregisters for the no-backend case).
 	url := runEmbeddedNATS(t)
 	sc := startSidecar(t, url, "http-lazy")
 
@@ -234,40 +233,6 @@ func TestHTTPAdmin_EndToEndWithGoEgress(t *testing.T) {
 	assert.Equal(t, "PY:world", resp.Msg)
 }
 
-// TestHTTPAdmin_CoexistsWithGRPCAdmin proves both admin paths share
-// the same openIngress / closeIngress machinery and don't trample one
-// another: one app registers via gRPC, another registers via HTTP,
-// both work and they can be torn down independently.
-func TestHTTPAdmin_CoexistsWithGRPCAdmin(t *testing.T) {
-	url := runEmbeddedNATS(t)
-	egress := startSidecar(t, url, "coexist-egress")
-	ingress := startSidecar(t, url, "coexist-ingress")
-
-	upA := startUpstreamEcho(t, &echoSrv{id: "A"})
-	upB := startUpstreamEcho(t, &echoSrv{id: "B"})
-
-	_, relA := registerApp(t, ingress.AdminAddr(), "svcCoA", upA, []string{"echo.Echo"})
-	defer relA()
-	_, _, relB := httpRegister(t, ingress.HTTPAdminAddr(), "svcCoB", upB, []string{"echo.Echo"})
-	defer relB()
-
-	ingress.mu.Lock()
-	count := len(ingress.registrations)
-	ingress.mu.Unlock()
-	assert.Equal(t, 2, count, "both admin paths should yield independent registrations")
-
-	conn := dialEgress(t, egress.EgressAddr())
-	cli := echo.NewEchoClient(conn)
-	for _, c := range []struct{ svcid, want string }{{"svcCoA", "A:x"}, {"svcCoB", "B:x"}} {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		ctx = metadata.AppendToOutgoingContext(ctx, "x-nats-svcid", c.svcid)
-		resp, err := cli.SayHello(ctx, &echo.HelloRequest{Msg: "x"})
-		cancel()
-		require.NoError(t, err)
-		assert.Equal(t, c.want, resp.Msg)
-	}
-}
-
 // TestHTTPAdmin_Disable verifies HTTPAdminAddr="-" turns the endpoint
 // off entirely (useful for tests, constrained environments, or
 // security audits that want to assert one fewer bound socket).
@@ -276,7 +241,6 @@ func TestHTTPAdmin_Disable(t *testing.T) {
 	sc := New(Config{
 		NATSURL:       url,
 		EgressAddr:    "127.0.0.1:0",
-		AdminAddr:     "127.0.0.1:0",
 		HTTPAdminAddr: "-",
 		Nid:           "disabled",
 	})

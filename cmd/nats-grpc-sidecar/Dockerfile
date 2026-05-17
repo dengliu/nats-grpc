@@ -34,6 +34,6 @@ COPY --from=builder /out/nats-grpc-sidecar /usr/local/bin/nats-grpc-sidecar
 # shares the pod's network namespace, so localhost reaches us).
 # For non-Kubernetes deployments, override with the -egress / -admin
 # flags as needed.
-EXPOSE 50051 50100 50101
+EXPOSE 50051 50101
 
 ENTRYPOINT ["/usr/local/bin/nats-grpc-sidecar"]

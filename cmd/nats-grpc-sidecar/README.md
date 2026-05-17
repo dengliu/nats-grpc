@@ -10,21 +10,16 @@ This README is the operator's reference for the binary itself.
 
 ## What it does
 
-Three loopback ports, plus one outbound NATS connection:
+Two loopback ports, plus one outbound NATS connection:
 
 | Port (default) | Purpose |
 |---|---|
 | `127.0.0.1:50051` | **Egress** (gRPC). The local app dials this to make outbound RPCs. Each call must carry routing metadata (see [Reserved headers](#reserved-headers)). |
-| `127.0.0.1:50100` | **Admin** (gRPC). Local apps that already use gRPC can register via the typed `SidecarAdmin.Register` stream. |
-| `127.0.0.1:50101` | **HTTP admin** (JSON). `POST /v1/register` opens a registration without any nats-grpc proto code-gen — meant for Python / Node / any language where running `protoc` against `sidecar.proto` is friction. The open HTTP connection is the lease, identical semantics to the gRPC admin. |
+| `127.0.0.1:50101` | **Admin** (HTTP/JSON). `POST /v1/register` opens a registration. The open HTTP connection is the lease; closing it deregisters. No codegen required — works from any language with an HTTP client. |
 
 Routing is **per-call, metadata-driven**. The caller stamps `x-nats-svcid`
 onto each call; the sidecar uses that as the NATS routing key. There is
 no static `service→svcid` config file.
-
-Both admin paths share the same `openIngress` machinery under the hood, so
-a fleet can mix and match — some Go services register via gRPC, some
-Python services register via HTTP, all are served identically.
 
 ## Building
 
@@ -44,7 +39,7 @@ docker build -f cmd/nats-grpc-sidecar/Dockerfile -t nats-grpc-sidecar:latest .
 ```
 
 Multi-stage build (`golang:1.26-alpine` → `alpine:latest`), statically
-linked, stripped. Exposes ports `50051` and `50100`.
+linked, stripped. Exposes ports `50051` and `50101`.
 
 For multi-arch (Apple Silicon → amd64 cluster):
 
@@ -59,7 +54,6 @@ docker build --platform linux/amd64 \
 ```
 -nats         string  NATS server URL (default "nats://localhost:4222")
 -egress       string  egress gRPC listen addr (default "127.0.0.1:50051")
--admin        string  gRPC admin listen addr (default "127.0.0.1:50100")
 -http-admin   string  HTTP/JSON admin listen addr (default "127.0.0.1:50101";
                       pass "-" to disable)
 -nid          string  sidecar nid (default: auto-generated, "sc-<random hex>")
@@ -73,11 +67,10 @@ network namespace, override `-egress` / `-admin` with a non-loopback
 address — and front it with TLS or a firewall, because the admin port
 has no authentication.
 
-## HTTP/JSON registration (polyglot)
+## Registration: POST /v1/register
 
-For services not written in Go, the simplest way to register is the
-HTTP admin. No proto codegen, no nats-grpc dependency — just a long-
-lived `POST` to `/v1/register`.
+Services register by POSTing to the HTTP admin port. No proto codegen,
+no nats-grpc dependency — just a long-lived HTTP request.
 
 **Wire format**:
 
@@ -172,17 +165,18 @@ headers, tenant IDs, auth tokens through unchanged.
 
 ## Lifecycle
 
-- **Startup**: opens the NATS connection and both gRPC listeners, then
-  blocks. Egress and admin start serving immediately; no warm-up.
+- **Startup**: opens the NATS connection and the two listeners (gRPC
+  egress, HTTP admin), then blocks. Both start serving immediately; no
+  warm-up.
 - **Ingress registration**: lazy. The sidecar opens no NATS
-  subscriptions until a local app calls `SidecarAdmin.Register`. Each
-  registration is leased by an open gRPC stream — drop the stream,
-  registrations evaporate.
+  subscriptions until a local app posts to `/v1/register`. Each
+  registration is leased by an open HTTP connection — drop the
+  connection, the registration evaporates.
 - **Shutdown** (`SIGINT` / `SIGTERM`): tears down all live registrations
-  (so the upstream apps' streams drain cleanly), then closes the gRPC
-  servers and the NATS connection. No graceful drain window for in-flight
-  RPCs — they fail fast with `Unavailable`. Don't terminate the sidecar
-  before the app it serves.
+  (so the upstream apps' streams drain cleanly), then closes the
+  listeners and the NATS connection. No graceful drain window for
+  in-flight RPCs — they fail fast with `Unavailable`. Don't terminate
+  the sidecar before the app it serves.
 
 ## Kubernetes deployment sketch
 
@@ -197,7 +191,7 @@ spec:
       containers:
         # The application: any gRPC server / client, any language.
         # Dials 127.0.0.1:50051 for outbound RPCs.
-        # Calls SidecarAdmin.Register on 127.0.0.1:50100 at boot.
+        # POSTs to http://127.0.0.1:50101/v1/register at boot.
         - name: app
           image: my-app:latest
 
@@ -207,10 +201,10 @@ spec:
           args:
             - "-nats=nats://nats.default.svc.cluster.local:4222"
             - "-egress=127.0.0.1:50051"
-            - "-admin=127.0.0.1:50100"
+            - "-http-admin=127.0.0.1:50101"
           ports:
             - { containerPort: 50051, name: egress }
-            - { containerPort: 50100, name: admin }
+            - { containerPort: 50101, name: admin }
 ```
 
 The app declares ingress (the svcids it serves) at startup via the admin

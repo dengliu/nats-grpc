@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/cloudwebrtc/nats-grpc/examples/protos/echo"
-	pb "github.com/cloudwebrtc/nats-grpc/pkg/protos/sidecar"
 	natsserver "github.com/nats-io/nats-server/v2/server"
 	natstest "github.com/nats-io/nats-server/v2/test"
 	"github.com/stretchr/testify/assert"
@@ -44,7 +43,6 @@ func startSidecar(t *testing.T, natsURL, nid string) *Sidecar {
 	sc := New(Config{
 		NATSURL:       natsURL,
 		EgressAddr:    "127.0.0.1:0",
-		AdminAddr:     "127.0.0.1:0",
 		HTTPAdminAddr: "127.0.0.1:0",
 		Nid:           nid,
 	})
@@ -103,31 +101,14 @@ func startUpstreamEcho(t *testing.T, impl *echoSrv) string {
 	return lis.Addr().String()
 }
 
-// registerApp drives the admin Register stream end-to-end and returns the
-// sidecar-assigned nid plus a release func that closes the stream.
-func registerApp(t *testing.T, adminAddr, svcid, upstream string, services []string) (string, func()) {
+// registerApp opens a registration through the HTTP/JSON admin (the
+// only admin path the sidecar exposes). Thin wrapper around
+// httpRegister; existing tests don't care about the streaming-ack
+// reader so we drop it here.
+func registerApp(t *testing.T, httpAdminAddr, svcid, upstream string, services []string) (string, func()) {
 	t.Helper()
-	conn, err := grpc.NewClient(adminAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = conn.Close() })
-
-	cli := pb.NewSidecarAdminClient(conn)
-	ctx, cancel := context.WithCancel(context.Background())
-	stream, err := cli.Register(ctx)
-	require.NoError(t, err)
-	require.NoError(t, stream.Send(&pb.RegisterRequest{Type: &pb.RegisterRequest_Init{
-		Init: &pb.Init{Svcid: svcid, Upstream: upstream, Services: services},
-	}}))
-	resp, err := stream.Recv()
-	require.NoError(t, err)
-	reg := resp.GetRegistered()
-	require.NotNil(t, reg, "expected Registered, got %T (err=%v)", resp.GetType(), resp.GetError())
-
-	release := func() {
-		cancel()
-		_ = stream.CloseSend()
-	}
-	return reg.Nid, release
+	nid, _, release := httpRegister(t, httpAdminAddr, svcid, upstream, services)
+	return nid, release
 }
 
 // dialEgress dials the sidecar's egress port with insecure credentials and
@@ -219,7 +200,7 @@ func TestEndToEnd_UnaryWithSidecarBothSides(t *testing.T) {
 
 	upstream := &echoSrv{id: "backend-A"}
 	upstreamAddr := startUpstreamEcho(t, upstream)
-	_, release := registerApp(t, ingress.AdminAddr(), "svcA", upstreamAddr, []string{"echo.Echo"})
+	_, release := registerApp(t, ingress.HTTPAdminAddr(), "svcA", upstreamAddr, []string{"echo.Echo"})
 	defer release()
 
 	conn := dialEgress(t, egress.EgressAddr())
@@ -256,12 +237,12 @@ func TestEndToEnd_DynamicSvcIDPerCall(t *testing.T) {
 
 	upstreamA := &echoSrv{id: "A"}
 	addrA := startUpstreamEcho(t, upstreamA)
-	_, relA := registerApp(t, ingressA.AdminAddr(), "serviceid_1", addrA, []string{"echo.Echo"})
+	_, relA := registerApp(t, ingressA.HTTPAdminAddr(), "serviceid_1", addrA, []string{"echo.Echo"})
 	defer relA()
 
 	upstreamB := &echoSrv{id: "B"}
 	addrB := startUpstreamEcho(t, upstreamB)
-	_, relB := registerApp(t, ingressB.AdminAddr(), "serviceid_2", addrB, []string{"echo.Echo"})
+	_, relB := registerApp(t, ingressB.HTTPAdminAddr(), "serviceid_2", addrB, []string{"echo.Echo"})
 	defer relB()
 
 	conn := dialEgress(t, egress.EgressAddr())
@@ -305,9 +286,9 @@ func TestEndToEnd_ConcurrentCallsRouteByInbox(t *testing.T) {
 	upB := &echoSrv{id: "B"}
 	addrA := startUpstreamEcho(t, upA)
 	addrB := startUpstreamEcho(t, upB)
-	_, relA := registerApp(t, ingA.AdminAddr(), "s1", addrA, []string{"echo.Echo"})
+	_, relA := registerApp(t, ingA.HTTPAdminAddr(), "s1", addrA, []string{"echo.Echo"})
 	defer relA()
-	_, relB := registerApp(t, ingB.AdminAddr(), "s2", addrB, []string{"echo.Echo"})
+	_, relB := registerApp(t, ingB.HTTPAdminAddr(), "s2", addrB, []string{"echo.Echo"})
 	defer relB()
 
 	conn := dialEgress(t, egress.EgressAddr())
@@ -353,7 +334,7 @@ func TestEndToEnd_Streaming(t *testing.T) {
 
 	upstream := &echoSrv{id: "S"}
 	addr := startUpstreamEcho(t, upstream)
-	nid, release := registerApp(t, ingress.AdminAddr(), "svcS", addr, []string{"echo.Echo"})
+	nid, release := registerApp(t, ingress.HTTPAdminAddr(), "svcS", addr, []string{"echo.Echo"})
 	defer release()
 	// Nid returned by Register should equal the ingress sidecar's own nid.
 	assert.Equal(t, ingress.Nid(), nid)
@@ -392,18 +373,19 @@ func TestEndToEnd_Streaming(t *testing.T) {
 	}
 }
 
-// TestAdmin_AppDeathDeregisters verifies that when the admin Register
-// stream drops, the sidecar tears down the corresponding NATS
-// subscriptions. After teardown, a unary call to that svcid must fail
-// with Unavailable (no subscribers → nats.ErrNoResponders).
-func TestAdmin_AppDeathDeregisters(t *testing.T) {
+// TestEndToEnd_AppDeathDeregisters is the black-box deregistration
+// check: while the app's HTTP /v1/register connection is open,
+// egress calls to its svcid succeed end-to-end; once that connection
+// drops, both the registrations map drains AND subsequent calls fail
+// at the NATS layer (no subscribers).
+func TestEndToEnd_AppDeathDeregisters(t *testing.T) {
 	url := runEmbeddedNATS(t)
 	egress := startSidecar(t, url, "egress-deathd")
 	ingress := startSidecar(t, url, "ingress-deathd")
 
 	upstream := &echoSrv{id: "X"}
 	addr := startUpstreamEcho(t, upstream)
-	_, release := registerApp(t, ingress.AdminAddr(), "svcDie", addr, []string{"echo.Echo"})
+	_, release := registerApp(t, ingress.HTTPAdminAddr(), "svcDie", addr, []string{"echo.Echo"})
 
 	// Sanity: while registered, calls succeed.
 	conn := dialEgress(t, egress.EgressAddr())
@@ -440,7 +422,7 @@ func TestAdmin_AppDeathDeregisters(t *testing.T) {
 	ingress.mu.Lock()
 	finalCount := len(ingress.registrations)
 	ingress.mu.Unlock()
-	require.Zero(t, finalCount, "ingress.registrations did not drain after Register stream closed")
+	require.Zero(t, finalCount, "ingress.registrations did not drain after HTTP register connection closed")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
