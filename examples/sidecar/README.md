@@ -1,0 +1,172 @@
+# Sidecar example — dynamic per-call routing
+
+A runnable scenario showing how the `nats-grpc` sidecar bridges plain gRPC
+and NATS, with the **same gRPC stub** routing each call to a different
+backend purely via metadata.
+
+```
+                  ┌──────────────────────────────────────┐
+                  │           NATS server                │
+                  └────────────┬──────────────┬──────────┘
+                               │              │
+              ┌────────────────┘              └────────────────┐
+              ▼                                                 ▼
+       ┌──────────────┐                                  ┌──────────────┐
+       │  sidecar     │                                  │  sidecar     │
+       │ (egress)     │                                  │ (ingress)    │
+       │ :50051       │                                  │              │
+       │ :50100 admin │                                  │ :50100 admin │
+       └──────▲───────┘                                  └──────▲───────┘
+              │                                                 │
+              │ gRPC over loopback                              │ gRPC over loopback
+              │   metadata: x-nats-svcid=serviceid_1|2          │   ↑
+              │                                                 │   │ register
+       ┌──────┴───────┐                                  ┌──────┴───┴───┐
+       │    client    │                                  │   backends   │
+       │ (calls 2x,   │                                  │  serviceid_1 │
+       │  different   │                                  │  serviceid_2 │
+       │  svcid each) │                                  │   (one each) │
+       └──────────────┘                                  └──────────────┘
+```
+
+The point: the client uses an **ordinary gRPC stub** (no nats-grpc imports,
+no awareness of NATS). It picks a backend per call by stamping
+`x-nats-svcid` into the call's metadata. Same stub, different routing.
+
+## What's in here
+
+- `sidecar/` — minimal sidecar binary. Connects to NATS, listens on a
+  loopback egress port (gRPC) and a loopback admin port (gRPC).
+- `server/` — echo backend. Stands up a real gRPC server, then calls
+  `SidecarAdmin.Register` to tell the sidecar "I'm serving `echo.Echo`
+  under svcid X; forward calls to me at this address."
+- `client/` — calls `SayHello` twice via the same stub, with two
+  different `x-nats-svcid` headers. Each call lands on a different
+  backend; the response prefix proves it.
+
+## Prerequisites
+
+- A running NATS server. The simplest way:
+  ```sh
+  go install github.com/nats-io/nats-server/v2@latest
+  nats-server
+  ```
+  Or `docker run -p 4222:4222 nats:latest`.
+
+- For the polyglot demo at the bottom, [`grpcurl`](https://github.com/fullstorydev/grpcurl):
+  ```sh
+  go install github.com/fullstorydev/grpcurl/cmd/grpcurl@latest
+  ```
+
+## Running it
+
+You'll need five terminals. The roles are: NATS, the two sidecars, the
+two backends, and the client. (You can collapse to one sidecar + two
+backends if you want — see "Single-sidecar mode" below.)
+
+```sh
+# Terminal 1 — NATS
+nats-server
+
+# Terminal 2 — sidecar 1 (will host the serviceid_1 ingress registration,
+#                          and is also where the client sends egress traffic)
+go run ./examples/sidecar/sidecar -egress 127.0.0.1:50051 -admin 127.0.0.1:50100 -nats nats://localhost:4222
+
+# Terminal 3 — sidecar 2 (hosts the serviceid_2 ingress registration; a
+#                          separate admin port so the two backends don't
+#                          collide on registration)
+go run ./examples/sidecar/sidecar -egress 127.0.0.1:50052 -admin 127.0.0.1:50200 -nats nats://localhost:4222
+
+# Terminal 4 — backend A (registers as serviceid_1 against sidecar 1)
+go run ./examples/sidecar/server -svcid serviceid_1 -admin 127.0.0.1:50100
+
+# Terminal 5 — backend B (registers as serviceid_2 against sidecar 2)
+go run ./examples/sidecar/server -svcid serviceid_2 -admin 127.0.0.1:50200
+
+# Terminal 6 — client (dials sidecar 1's egress port)
+go run ./examples/sidecar/client -egress 127.0.0.1:50051
+```
+
+Expected client output:
+
+```
+→ serviceid_1: reply="serviceid_1: hello world"
+→ serviceid_2: reply="serviceid_2: hello world"
+```
+
+The client made two calls through the same stub; the routing was
+decided entirely by the `x-nats-svcid` value attached to each call's
+context. Neither backend knows about NATS — they're plain `echo.Echo`
+servers.
+
+### Single-sidecar mode
+
+A single sidecar instance can serve both ingress registrations on one
+admin port if you give them distinct local listen ports for the
+backends. In that variant, drop terminal 3 and point both backend
+processes at the same `-admin 127.0.0.1:50100`.
+
+## The polyglot story — grpcurl
+
+The whole point of the sidecar is that the local app's *language* is
+irrelevant. To prove it, hit the same egress port with `grpcurl` — a
+generic CLI tool that has zero awareness of nats-grpc:
+
+```sh
+grpcurl \
+  -plaintext \
+  -import-path ./examples/protos \
+  -proto echo.proto \
+  -H "x-nats-svcid: serviceid_1" \
+  -d '{"msg":"world"}' \
+  127.0.0.1:50051 \
+  echo.Echo/SayHello
+```
+
+Response:
+```json
+{
+  "msg": "serviceid_1: hello world"
+}
+```
+
+Swap `serviceid_1` → `serviceid_2` in the `-H` header and you'll see
+the call routed to the other backend. Same gRPC port, same proto,
+different backend — selected by one header value.
+
+Any gRPC client in any language can do exactly this. The local app
+does not need to import nats-grpc.
+
+## Failure modes worth observing
+
+A few things to try once it's running:
+
+- **Missing routing header.** Calls without `x-nats-svcid` return
+  `InvalidArgument` from the sidecar without ever publishing to NATS:
+  ```sh
+  grpcurl -plaintext -import-path ./examples/protos -proto echo.proto \
+    -d '{"msg":"x"}' 127.0.0.1:50051 echo.Echo/SayHello
+  # Error: rpc error: code = InvalidArgument desc = x-nats-svcid header is required
+  ```
+
+- **Backend dies.** Kill terminal 4 (the `serviceid_1` backend). The
+  next call to `serviceid_1` fails (`Unavailable` or `DeadlineExceeded`
+  depending on NATS server version — see `pkg/sidecar/sidecar_test.go`
+  for why). Calls to `serviceid_2` continue to work.
+
+- **Reserved headers are stripped.** Add `-H "x-nats-svcid: serviceid_1"
+  -H "x-tenant: acme"` to the grpcurl call. The backend logs will show
+  `x-tenant: [acme]` in its incoming metadata, but **not** `x-nats-svcid`
+  — the sidecar strips its own routing fuel before forwarding.
+
+## What this example does NOT demonstrate
+
+- **Streaming.** Would need `x-nats-mode: streaming` and
+  `x-nats-target-nid: <sidecar nid>`. See `pkg/sidecar/sidecar_test.go`
+  → `TestEndToEnd_Streaming` for the wire shape.
+- **TLS / auth.** The sidecar trusts loopback. Adding TLS to the
+  sidecar↔app hop is straightforward (`grpc.NewServer` with creds)
+  but out of scope here.
+- **Discovery.** The client must know which svcids exist. A future
+  discovery layer (NATS service framework or a custom heartbeat
+  subject) would make this dynamic — see `SIDECAR.md` §12.
