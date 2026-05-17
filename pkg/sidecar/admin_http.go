@@ -110,11 +110,13 @@ func (s *Sidecar) handleHTTPRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	flusher.Flush()
 
-	// Hold the connection — it IS the lease. r.Context().Done() fires
-	// the moment the client closes the connection (process exit, app
-	// crash, network tear-down); s.done fires on sidecar shutdown.
-	// Either way the deferred closeIngress above runs and we
-	// deregister.
+	// Hold the connection — it IS the lease. <-r.Context().Done() is
+	// the idiomatic net/http way to wait for a client disconnect: the
+	// stdlib cancels Request.Context() when the underlying TCP
+	// connection closes (process exit, app crash, network tear-down).
+	// The select adds a second case for sidecar shutdown since s.done
+	// is a plain channel rather than a context. Either path runs the
+	// deferred closeIngress above and we deregister.
 	select {
 	case <-r.Context().Done():
 	case <-s.done:

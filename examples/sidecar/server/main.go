@@ -90,9 +90,11 @@ func registerWithSidecar(ctx context.Context, adminURL, svcid, upstream string, 
 
 	// Hold the connection — it IS the registration lease. The sidecar
 	// sends no further bytes after the initial Registered line, so
-	// this Read blocks until the connection is torn down: by the
-	// sidecar (shutdown), by the network (drop), or by us (ctx
-	// cancel via SIGINT).
+	// io.Copy(io.Discard, reader) blocks until EOF: the connection is
+	// torn down by the sidecar (shutdown), the network (drop), or us
+	// (ctx cancel via SIGINT). io.Copy + io.Discard is the canonical
+	// stdlib idiom for "drain a stream to EOF without keeping the
+	// bytes" — no manual read loop needed.
 	if _, err := io.Copy(io.Discard, reader); err != nil {
 		return err
 	}

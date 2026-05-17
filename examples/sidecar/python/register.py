@@ -98,13 +98,11 @@ def register_and_hold(
     print(f"[{now_iso()}] registered with sidecar nid = {msg['nid']}")
     print(f"[{now_iso()}] holding connection (the registration lease) — Ctrl-C to deregister")
 
-    # Block reading the body until the connection drops. resp.raw.read
-    # returns b'' on EOF; we discard whatever bytes might arrive
-    # (currently none) and exit when the stream ends.
-    while True:
-        chunk = resp.raw.read(4096)
-        if not chunk:
-            break
+    # Block until the connection drops. resp.raw.read() with no size
+    # is the idiomatic "drain to EOF" form in `requests` — it returns
+    # b'' as soon as the server closes the stream (which is also when
+    # the sidecar has deregistered our svcid).
+    resp.raw.read()
     print(f"[{now_iso()}] registration connection closed")
 
 
