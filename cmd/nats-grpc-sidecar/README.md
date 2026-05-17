@@ -86,20 +86,18 @@ Content-Type: application/json
 ```
 
 Response is `200 OK` with `Content-Type: application/x-ndjson`. The
-first line carries the sidecar's nid; subsequent lines are periodic
-keepalive acks every 30 seconds:
+sidecar writes **exactly one line** carrying the assigned nid, then
+holds the response stream open with no further bytes:
 
 ```
 {"nid":"sc-abc123"}
-{"ack":1738000000000000000}
-{"ack":1738000030000000000}
-...
 ```
 
 **The lease is the open HTTP connection.** When the client (or the
-network) drops it, the sidecar deregisters automatically. Don't reuse
-HTTP/2 connection pools for this call — keep the request itself
-open.
+network) drops it, the sidecar deregisters automatically. There is
+no application-level heartbeat — TCP-level connection close is the
+signal. Don't reuse HTTP/2 connection pools for this call; keep the
+request itself open.
 
 Validation failures (missing `svcid`, bad JSON, wrong method, unknown
 fields) return `4xx` with a JSON `{"error":"..."}` body before any
@@ -114,20 +112,17 @@ def register_with_sidecar(svcid, upstream, services):
     resp = requests.post(
         "http://127.0.0.1:50101/v1/register",
         json={"svcid": svcid, "upstream": upstream, "services": services},
-        stream=True,  # don't buffer the body — we want NDJSON lines
+        stream=True,
         timeout=None,
     )
     resp.raise_for_status()
-    lines = resp.iter_lines()
-    initial = json.loads(next(lines))
+    initial = json.loads(next(resp.iter_lines(decode_unicode=True)))
     print(f"registered, sidecar nid = {initial['nid']}")
-    # Hold the connection. Acks come every 30s; the loop exits when
-    # the connection drops (which is what we want — the sidecar is
-    # already tearing us down).
-    for line in lines:
-        if not line:
-            continue
-        # ignore ack bodies, or use them to detect dead sidecars
+    # Hold the connection — it IS the lease. resp.raw.read returns b''
+    # when the sidecar/network closes the stream, which is also when
+    # the sidecar has already deregistered our svcid.
+    while resp.raw.read(4096):
+        pass
 
 # Run in a background thread so the app's gRPC server can do real work.
 threading.Thread(
@@ -140,14 +135,15 @@ threading.Thread(
 **curl** to verify the endpoint at a glance:
 
 ```sh
-curl -N -X POST \
+curl -X POST \
   -H "Content-Type: application/json" \
   -d '{"svcid":"foo","upstream":"127.0.0.1:8080","services":["pkg.X"]}' \
   http://127.0.0.1:50101/v1/register
 ```
 
-`-N` is important — without it curl buffers the body and you won't see
-the streamed NDJSON lines.
+The command prints `{"nid":"..."}` and then hangs — that's correct
+behavior; the hang IS the registration lease. Hit Ctrl-C to drop it
+and the sidecar deregisters.
 
 ## Reserved headers
 

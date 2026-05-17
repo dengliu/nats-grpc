@@ -47,8 +47,8 @@ The sidecar binary itself lives in [`cmd/nats-grpc-sidecar/`](../../cmd/nats-grp
 next to it for container builds.
 
 For a Python-language version of the same registration flow, see
-[`python/`](./python/) — a minimal `heartbeat_register.py` that uses
-only `requests`, demonstrating that registration needs no `protoc` or
+[`python/`](./python/) — a minimal `register.py` that uses only
+`requests`, demonstrating that registration needs no `protoc` or
 nats-grpc dependency in non-Go languages.
 
 ## Prerequisites
@@ -109,11 +109,10 @@ context. Neither backend knows about NATS — they're plain `echo.Echo`
 servers, and registration is plain HTTP/JSON (no nats-grpc
 dependency).
 
-In a backend's terminal you'll also see periodic heartbeat acks like
-`heartbeat ack ts=1716000000000000000` every 30 seconds. The open
-HTTP connection to the sidecar IS the registration lease; closing
-the terminal drops the connection and the sidecar deregisters
-automatically.
+Each backend's terminal stays quiet after registration — that's
+expected. The open HTTP connection to the sidecar IS the
+registration lease; closing the terminal drops the connection and
+the sidecar deregisters automatically.
 
 ### Single-sidecar mode
 

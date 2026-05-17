@@ -39,10 +39,10 @@ func (s *echoServer) SayHello(_ context.Context, req *echo.HelloRequest) (*echo.
 }
 
 // registerWithSidecar opens a long-lived POST /v1/register against the
-// sidecar's HTTP admin port. The first response line carries the
-// sidecar's nid; subsequent lines are keepalive acks. The open HTTP
-// connection IS the registration lease: when this function returns
-// (because we exit the read loop or the connection drops), the
+// sidecar's HTTP admin port. The sidecar writes exactly one response
+// line carrying its nid and then holds the stream open. The open
+// HTTP connection IS the registration lease: when this function
+// returns (the connection drops or the sidecar shuts down), the
 // sidecar's per-connection handler runs its deferred closeIngress
 // and the NATS subscriptions tear down.
 func registerWithSidecar(ctx context.Context, adminURL, svcid, upstream string, services []string) error {
@@ -88,23 +88,15 @@ func registerWithSidecar(ctx context.Context, adminURL, svcid, upstream string, 
 	}
 	log.Printf("registered with sidecar — sidecar nid=%s", initial.Nid)
 
-	// Hold the connection. Each NDJSON line we read is a keepalive
-	// ack from the sidecar (production cadence is every 30s). The
-	// loop exits when:
-	//   - the connection drops (sidecar gone, network blip) → reader returns err
-	//   - ctx is cancelled (SIGINT/SIGTERM)        → reader.ReadBytes unblocks via ctx
-	for {
-		line, err := reader.ReadBytes('\n')
-		if err != nil {
-			return err
-		}
-		var msg map[string]any
-		if json.Unmarshal(line, &msg) == nil {
-			if ts, ok := msg["ack"]; ok {
-				log.Printf("heartbeat ack ts=%v", ts)
-			}
-		}
+	// Hold the connection — it IS the registration lease. The sidecar
+	// sends no further bytes after the initial Registered line, so
+	// this Read blocks until the connection is torn down: by the
+	// sidecar (shutdown), by the network (drop), or by us (ctx
+	// cancel via SIGINT).
+	if _, err := io.Copy(io.Discard, reader); err != nil {
+		return err
 	}
+	return io.EOF
 }
 
 func main() {

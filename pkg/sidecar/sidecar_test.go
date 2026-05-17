@@ -103,12 +103,10 @@ func startUpstreamEcho(t *testing.T, impl *echoSrv) string {
 
 // registerApp opens a registration through the HTTP/JSON admin (the
 // only admin path the sidecar exposes). Thin wrapper around
-// httpRegister; existing tests don't care about the streaming-ack
-// reader so we drop it here.
+// httpRegister.
 func registerApp(t *testing.T, httpAdminAddr, svcid, upstream string, services []string) (string, func()) {
 	t.Helper()
-	nid, _, release := httpRegister(t, httpAdminAddr, svcid, upstream, services)
-	return nid, release
+	return httpRegister(t, httpAdminAddr, svcid, upstream, services)
 }
 
 // dialEgress dials the sidecar's egress port with insecure credentials and

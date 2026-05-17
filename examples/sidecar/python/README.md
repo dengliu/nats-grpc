@@ -1,20 +1,19 @@
-# Python sidecar example — registration + heartbeat acks
+# Python sidecar example — registration
 
 A Python script that registers itself with the nats-grpc sidecar via the
-HTTP/JSON admin endpoint and prints each heartbeat ack as it arrives.
-This is the smallest possible demonstration that a non-Go language can
-participate in the sidecar lifecycle with **no nats-grpc dependency**
-and **no proto codegen** — just `requests` and the standard library.
+HTTP/JSON admin endpoint and holds the connection open as the lease.
+Demonstrates that participating in the sidecar lifecycle from a non-Go
+language needs **no nats-grpc dependency** and **no proto codegen** —
+just `requests` and the standard library.
 
 ## What it shows
 
 1. **Registration is plain HTTP.** No grpc-python, no generated stubs.
 2. **The connection is the lease.** As long as the script holds the
    open response stream, the sidecar keeps its NATS subscriptions
-   alive on this svcid's behalf.
-3. **Heartbeat acks land every 30 seconds.** Each one proves the lease
-   is still healthy end-to-end (TCP + sidecar + you).
-4. **Shutdown is automatic.** Ctrl-C closes the connection; the sidecar
+   alive on this svcid's behalf. There is no application-level
+   heartbeat — TCP-level connection close is the signal.
+3. **Shutdown is automatic.** Ctrl-C closes the connection; the sidecar
    tears down the subscriptions immediately. No deregister API call
    needed.
 
@@ -32,7 +31,7 @@ and **no proto codegen** — just `requests` and the standard library.
 ## Running
 
 ```sh
-python heartbeat_register.py
+python register.py
 ```
 
 Expected output (timestamps will differ):
@@ -41,15 +40,12 @@ Expected output (timestamps will differ):
 [2026-05-16T17:30:00.000Z] dummy upstream listening on 127.0.0.1:54321
 [2026-05-16T17:30:00.005Z] POST http://127.0.0.1:50101/v1/register body={'svcid': 'python-demo', 'upstream': '127.0.0.1:54321', 'services': ['echo.Echo']}
 [2026-05-16T17:30:00.012Z] registered with sidecar nid = sc-abc123def456
-[2026-05-16T17:30:30.123Z] heartbeat ack ts=1716000030123456789
-[2026-05-16T17:31:00.456Z] heartbeat ack ts=1716000060456789012
-[2026-05-16T17:31:30.789Z] heartbeat ack ts=1716000090789012345
-...
+[2026-05-16T17:30:00.013Z] holding connection (the registration lease) — Ctrl-C to deregister
 ```
 
-Press Ctrl-C to drop the connection — you'll see "shutting down", and
-on the sidecar's side the registration disappears immediately. Restart
-the script and it re-registers.
+The script then blocks. Press Ctrl-C — you'll see "shutting down",
+the TCP connection drops, and on the sidecar's side the registration
+disappears immediately.
 
 ### Flags
 
@@ -66,7 +62,7 @@ This script does NOT serve real gRPC traffic. It listens on a TCP port
 just so the sidecar has somewhere to dial, but the listener immediately
 closes accepted connections — any client RPC that the sidecar tries to
 forward will fail at the HTTP/2 layer. The point of the demo is the
-**registration + heartbeat lifecycle**, not RPC forwarding.
+**registration + lease lifecycle**, not RPC forwarding.
 
 ## Adding a real gRPC server
 
@@ -104,13 +100,13 @@ port = server.add_insecure_port("127.0.0.1:0")
 server.start()
 upstream = f"127.0.0.1:{port}"
 
-# Then register exactly as heartbeat_register.py does, passing this
-# `upstream` to the sidecar. Calls arriving on the egress side with
+# Then register exactly as register.py does, passing this `upstream`
+# to the sidecar. Calls arriving on the egress side with
 # `x-nats-svcid: python-demo` will now reach the SayHello handler.
 ```
 
-The heartbeat + registration code stays identical — that's the whole
-point of the HTTP admin contract.
+The registration code stays identical — that's the whole point of the
+HTTP admin contract.
 
 ## Why HTTP, not gRPC, for registration
 
@@ -123,5 +119,5 @@ from Python required:
 4. Import `nats_grpc_sidecar_pb2_grpc` from somewhere
 
 Friction the rest of the integration doesn't have. The HTTP/JSON
-endpoint dropped all of that — every language that can do an HTTP
-POST and parse JSON can participate.
+endpoint drops all of that — every language that can do an HTTP POST
+and parse JSON can participate.

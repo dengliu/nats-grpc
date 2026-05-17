@@ -384,14 +384,11 @@ Content-Type: application/json
 ```
 
 The response is `200 OK` with `Content-Type: application/x-ndjson`.
-First line carries the sidecar's nid; subsequent lines are periodic
-keepalive acks:
+The sidecar writes **exactly one line** with the assigned nid and
+then holds the stream open with no further bytes:
 
 ```
 {"nid":"sc-abc123"}
-{"ack":1716000000000000000}
-{"ack":1716000030000000000}
-...
 ```
 
 App-side flow:
@@ -401,9 +398,10 @@ App-side flow:
 2. App starts its gRPC server on :8080.
 3. App POSTs to http://127.0.0.1:50101/v1/register with the JSON above.
 4. Sidecar opens NATS subscriptions, sends Registered{nid}.
-5. App holds the HTTP connection open. Acks arrive every ~30s.
+5. App holds the HTTP connection open — the connection IS the lease.
 6. When the app exits, the connection closes; sidecar tears down the
-   subscriptions automatically.
+   subscriptions automatically. No application-level heartbeat
+   required: TCP-level connection close is the signal.
 ```
 
 HTTP rather than gRPC for registration is a deliberate polyglot
@@ -471,27 +469,19 @@ func (s *Sidecar) handleHTTPRegister(w http.ResponseWriter, r *http.Request) {
     writeJSONLine(w, map[string]any{"nid": s.cfg.Nid})
     w.(http.Flusher).Flush()
 
-    // Hold the connection. Acks keep middleboxes happy and surface
-    // dead clients via failed writes. Exit on r.Context().Done()
-    // (client disconnect) or sidecar shutdown.
-    ticker := time.NewTicker(httpAdminKeepaliveInterval)
-    defer ticker.Stop()
-    for {
-        select {
-        case <-r.Context().Done():  return
-        case <-s.done:              return
-        case <-ticker.C:
-            if err := writeJSONLine(w, map[string]any{"ack": time.Now().UnixNano()}); err != nil { return }
-            w.(http.Flusher).Flush()
-        }
+    // Hold the connection — it IS the lease. r.Context().Done() fires
+    // the moment the client closes the connection; s.done fires on
+    // sidecar shutdown. The deferred closeIngress runs either way.
+    select {
+    case <-r.Context().Done():
+    case <-s.done:
     }
 }
 ```
 
-The long-lived HTTP request IS the lease. Standard HTTP semantics
-already give us "client died → connection dropped → server learns
-about it" without any extra liveness protocol — same property the
-gRPC streaming approach would have provided.
+The long-lived HTTP request IS the lease. Standard HTTP / TCP
+semantics already give us "client died → connection dropped → server
+learns about it" without any extra liveness protocol.
 
 ### Re-registration / mid-flight changes
 
@@ -521,16 +511,18 @@ nats:
 egress:
   addr: 127.0.0.1:50051
 
-# Admin: gRPC server local apps register ingress with.
-admin:
-  addr: 127.0.0.1:50100
+# Admin: HTTP/JSON endpoint local apps POST to for registration.
+http_admin:
+  addr: 127.0.0.1:50101
 
 # Sidecar identity (used as the streaming-subscription <nid>).
 # Defaults to UUIDv4 generated at startup. Override for sticky routing
 # (e.g. when the operator wants pod_name in subjects).
 nid: ${POD_NAME}
 
-# Heartbeat / observability tuning (optional).
+# nrpc streaming-RPC heartbeat tuning (optional). Unrelated to the
+# HTTP admin lease — these tune the Ping/Pong cadence used on
+# long-lived nrpc streams between sidecars.
 heartbeat:
   ping_interval: 5s
   pong_timeout: 15s

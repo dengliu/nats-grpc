@@ -1,27 +1,23 @@
-"""Heartbeat-focused registration demo for the nats-grpc sidecar.
+"""Registration demo for the nats-grpc sidecar, from Python.
 
-Demonstrates the HTTP/JSON admin protocol from Python without any
-nats-grpc imports or generated code — just `requests` and `json`.
-Run this against a sidecar bound to 127.0.0.1:50101 (the default)
-and you'll see:
+Demonstrates the HTTP/JSON admin protocol with no nats-grpc imports
+and no proto codegen — just `requests` and the standard library.
 
-    registered with sidecar nid = sc-...
-    heartbeat ack at 2026-05-16T17:00:30.123Z
-    heartbeat ack at 2026-05-16T17:01:00.456Z
-    ...
+The script:
 
-Acks arrive every 30 seconds (the sidecar's default keepalive
-interval). The open HTTP connection IS the registration lease: drop
-it (Ctrl-C, kill the process, pull the network cable) and the
-sidecar tears down the NATS subscriptions automatically.
+  1. Binds a placeholder TCP listener so the sidecar has a real
+     `upstream` address to forward to.
+  2. POSTs JSON to /v1/register and reads exactly one line of NDJSON
+     containing the assigned sidecar nid.
+  3. Holds the response stream open. **The open HTTP connection IS
+     the registration lease.** When this process exits (Ctrl-C, kill,
+     crash), the TCP connection drops and the sidecar deregisters
+     the NATS subscriptions immediately.
 
-This script does NOT include a real gRPC server — the "upstream"
-address it gives to the sidecar points at a placeholder TCP
-listener that just keeps the port reachable. To turn this into a
-production-style integration, swap the dummy listener for an
-actual `grpc.server(...)` and the calls coming through the sidecar
-will land on your handlers. See the "Adding a real gRPC server"
-section in the README.
+The sidecar sends no further bytes after the Registered line, so the
+script just blocks on the response body until the connection tears
+down. There is no application-level heartbeat — TCP-level connection
+close is the signal.
 """
 from __future__ import annotations
 
@@ -39,11 +35,10 @@ import requests
 
 # ---------------------------------------------------------------------------
 # A bare TCP listener that acts as a placeholder for the local gRPC server.
-#
 # The sidecar will dial this address when traffic arrives for our svcid.
-# Without a real gRPC server on the other end the call will fail at the
-# HTTP/2 layer — but registration + heartbeats still work, which is what
-# this demo focuses on.
+# Without a real gRPC server on the other end calls would fail at the
+# HTTP/2 layer — but registration + lease still work, which is what this
+# demo focuses on.
 # ---------------------------------------------------------------------------
 
 def start_dummy_listener(addr: str) -> tuple[socket.socket, str]:
@@ -56,9 +51,6 @@ def start_dummy_listener(addr: str) -> tuple[socket.socket, str]:
     actual_host, actual_port = sock.getsockname()
 
     def accept_loop():
-        # Accept and immediately drop — we never speak HTTP/2. The sidecar
-        # will see EOF and report Unavailable to its egress caller. We
-        # don't care; we're demonstrating heartbeats, not RPCs.
         while True:
             try:
                 conn, _ = sock.accept()
@@ -71,7 +63,7 @@ def start_dummy_listener(addr: str) -> tuple[socket.socket, str]:
 
 
 # ---------------------------------------------------------------------------
-# Registration + heartbeat loop.
+# Registration.
 # ---------------------------------------------------------------------------
 
 def now_iso() -> str:
@@ -84,35 +76,36 @@ def register_and_hold(
     upstream: str,
     services: Iterable[str],
 ) -> None:
-    """POST a registration, then block reading the NDJSON ack stream.
+    """POST a registration, read the nid, then hold the connection open.
 
-    Returns only when the connection breaks (sidecar shutdown, network
-    error, or local SIGINT).
+    Returns only when the connection drops (sidecar shutdown, network
+    error, or local SIGINT closing the socket).
     """
     body = {"svcid": svcid, "upstream": upstream, "services": list(services)}
     print(f"[{now_iso()}] POST {admin_url} body={body}")
 
     # stream=True so requests doesn't buffer the body — we want to read
-    # each NDJSON line as the sidecar writes it. timeout=None so the
-    # request doesn't get aborted while we hold the lease.
+    # the initial NDJSON line as soon as the sidecar writes it.
+    # timeout=None so the connection isn't aborted while we hold the
+    # lease.
     resp = requests.post(admin_url, json=body, stream=True, timeout=None)
     resp.raise_for_status()
 
-    lines = resp.iter_lines(decode_unicode=True)
-    first = json.loads(next(lines))
-    print(f"[{now_iso()}] registered with sidecar nid = {first['nid']}")
+    # The sidecar writes exactly one line ({"nid":"..."}) and then
+    # nothing — the open connection IS the lease.
+    first = next(resp.iter_lines(decode_unicode=True))
+    msg = json.loads(first)
+    print(f"[{now_iso()}] registered with sidecar nid = {msg['nid']}")
+    print(f"[{now_iso()}] holding connection (the registration lease) — Ctrl-C to deregister")
 
-    # Hold the connection. Each line is a {"ack": <unix_nano>} message;
-    # the sidecar sends one every 30 seconds by default. The loop ends
-    # when iter_lines raises (connection closed) or the user hits ^C.
-    for raw in lines:
-        if not raw:
-            continue
-        msg = json.loads(raw)
-        if "ack" in msg:
-            print(f"[{now_iso()}] heartbeat ack ts={msg['ack']}")
-        else:
-            print(f"[{now_iso()}] unexpected message: {msg}")
+    # Block reading the body until the connection drops. resp.raw.read
+    # returns b'' on EOF; we discard whatever bytes might arrive
+    # (currently none) and exit when the stream ends.
+    while True:
+        chunk = resp.raw.read(4096)
+        if not chunk:
+            break
+    print(f"[{now_iso()}] registration connection closed")
 
 
 # ---------------------------------------------------------------------------
@@ -120,10 +113,8 @@ def register_and_hold(
 # ---------------------------------------------------------------------------
 
 def main() -> int:
-    # Force line-buffered stdout so heartbeat acks show up promptly
-    # when this script is run under a parent that pipes its output
-    # (Docker, tee, kubectl logs, etc.). Otherwise Python's default
-    # block-buffering hides the live progress for minutes at a time.
+    # Force line-buffered stdout so log lines show up promptly under a
+    # parent that pipes their output (Docker, tee, kubectl logs, etc.).
     sys.stdout.reconfigure(line_buffering=True)
 
     ap = argparse.ArgumentParser(description=__doc__)
@@ -132,7 +123,7 @@ def main() -> int:
     ap.add_argument("--svcid", default="python-demo",
                     help="svcid to register under")
     ap.add_argument("--listen", default="127.0.0.1:0",
-                    help="placeholder TCP listen addr (default: OS-picks)")
+                    help="placeholder TCP listen addr (default: OS picks)")
     ap.add_argument("--services", default="echo.Echo",
                     help="comma-separated proto service names")
     args = ap.parse_args()
@@ -140,7 +131,7 @@ def main() -> int:
     sock, upstream = start_dummy_listener(args.listen)
     print(f"[{now_iso()}] dummy upstream listening on {upstream}")
 
-    # Cleanly close the listener on signal so the port is released.
+    # Close the listener on signal so the port is released.
     def shutdown(_signum, _frame):
         print(f"\n[{now_iso()}] shutting down")
         try:
@@ -158,7 +149,6 @@ def main() -> int:
         print(f"[{now_iso()}] registration error: {e}", file=sys.stderr)
         return 1
     except StopIteration:
-        # Sidecar closed the stream before sending Registered{nid}.
         print(f"[{now_iso()}] sidecar closed the stream during registration",
               file=sys.stderr)
         return 1

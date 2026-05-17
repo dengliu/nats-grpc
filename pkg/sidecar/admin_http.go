@@ -6,57 +6,24 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"sync"
 	"time"
 )
 
-// HTTP/JSON admin — an ergonomic alternative to the gRPC SidecarAdmin
-// for languages where running protoc against sidecar.proto is friction
-// (Python, Node, Ruby, …). Same semantics as the gRPC admin:
+// HTTP/JSON admin — language-agnostic registration endpoint:
 //
 //	POST /v1/register   body: {"svcid","upstream","services"}
-//	→  200 OK, NDJSON streaming response:
-//	      first line:  {"nid":"…"}
-//	      subsequent:  {"ack":<server_unix_nano>}     every keepaliveInterval
-//	The open HTTP connection IS the lease — when the client (or the
-//	network) drops it, the sidecar tears down the NATS subscriptions
-//	and aborts in-flight ingress RPCs, just like the gRPC admin path.
+//	→  200 OK, single NDJSON line: {"nid":"…"}
+//	   then the response stream stays open with no further bytes.
+//
+// The open HTTP connection IS the lease. When the client (or the
+// network) drops it, the sidecar tears down the NATS subscriptions
+// and aborts in-flight ingress RPCs. No application-level heartbeat
+// is needed: the documented deployment is a Kubernetes pod-mate over
+// loopback, where TCP-level connection close is detected immediately.
 //
 // Validation failures (missing required fields, bad JSON, wrong method,
 // wrong path) return ordinary 4xx responses with a small JSON error
-// body. There is no authentication — the endpoint binds to loopback
-// for the same reason the gRPC admin does.
-
-// httpAdminKeepaliveInterval is how often we emit an {"ack":…} line on
-// the open NDJSON stream. The interval has two jobs: keep idle middle
-// boxes (NAT, proxies) from dropping the connection, and surface
-// hung-write conditions to the server-side write goroutine so we
-// notice a dead client even when the client side never sends anything.
-//
-// Mutable so tests can dial it down — guarded by a package-level
-// mutex even though concurrent test mutation isn't a real risk,
-// because the production read happens on a request goroutine and
-// running -race would otherwise complain.
-var (
-	httpAdminKeepaliveMu       sync.Mutex
-	httpAdminKeepaliveInterval = 30 * time.Second
-)
-
-func getHTTPAdminKeepalive() time.Duration {
-	httpAdminKeepaliveMu.Lock()
-	defer httpAdminKeepaliveMu.Unlock()
-	return httpAdminKeepaliveInterval
-}
-
-// setHTTPAdminKeepalive is a test-only hook. Returns the previous
-// value so tests can restore it via defer.
-func setHTTPAdminKeepalive(d time.Duration) time.Duration {
-	httpAdminKeepaliveMu.Lock()
-	defer httpAdminKeepaliveMu.Unlock()
-	prev := httpAdminKeepaliveInterval
-	httpAdminKeepaliveInterval = d
-	return prev
-}
+// body. There is no authentication — the endpoint binds to loopback.
 
 type httpRegisterRequest struct {
 	Svcid    string   `json:"svcid"`
@@ -143,27 +110,14 @@ func (s *Sidecar) handleHTTPRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	flusher.Flush()
 
-	// Hold the connection as the lease. We loop on either:
-	//   - r.Context().Done() — connection closed (client gone, sidecar
-	//     shutting down, ReadTimeout elapsed, etc.). Either way we
-	//     deregister via the deferred closeIngress.
-	//   - keepaliveInterval — write a small {"ack":…} line. If the
-	//     write fails (typically EPIPE / connection reset), bail
-	//     and let the defer run.
-	ticker := time.NewTicker(getHTTPAdminKeepalive())
-	defer ticker.Stop()
-	for {
-		select {
-		case <-r.Context().Done():
-			return
-		case <-s.done:
-			return
-		case <-ticker.C:
-			if err := writeJSONLine(w, map[string]any{"ack": time.Now().UnixNano()}); err != nil {
-				return
-			}
-			flusher.Flush()
-		}
+	// Hold the connection — it IS the lease. r.Context().Done() fires
+	// the moment the client closes the connection (process exit, app
+	// crash, network tear-down); s.done fires on sidecar shutdown.
+	// Either way the deferred closeIngress above runs and we
+	// deregister.
+	select {
+	case <-r.Context().Done():
+	case <-s.done:
 	}
 }
 

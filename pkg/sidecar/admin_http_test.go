@@ -20,11 +20,11 @@ import (
 )
 
 // httpRegister is the language-agnostic flow a Python/Node caller would
-// follow: POST JSON, read the first NDJSON line for the nid, optionally
-// read further keepalive acks. Returns the parsed nid, a function the
-// test can call to read the next streamed line (blocking), and a
-// release func that closes the connection.
-func httpRegister(t *testing.T, addr, svcid, upstream string, services []string) (nid string, readLine func() (map[string]any, error), release func()) {
+// follow: POST JSON and read the single NDJSON line carrying the nid.
+// The response stream stays open as the registration lease — return
+// the release func; calling it closes the response body which closes
+// the TCP connection which triggers deregistration.
+func httpRegister(t *testing.T, addr, svcid, upstream string, services []string) (nid string, release func()) {
 	t.Helper()
 	body, _ := json.Marshal(httpRegisterRequest{Svcid: svcid, Upstream: upstream, Services: services})
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost,
@@ -40,11 +40,10 @@ func httpRegister(t *testing.T, addr, svcid, upstream string, services []string)
 
 	resp, err := client.Do(req)
 	require.NoError(t, err)
-	// Don't pass readBody(resp) to require.Equal — testify evaluates
-	// message args eagerly, and reading the body here would block
-	// forever (the registration lease keeps the response stream open
-	// indefinitely). Read a small prefix of the body only if the
-	// assertion is going to fail.
+	// Don't pass any read-the-body helper to require.Equal — testify
+	// evaluates message args eagerly and reading the body here would
+	// block (the registration lease keeps the stream open
+	// indefinitely). Read a small prefix only on the failure path.
 	if resp.StatusCode != http.StatusOK {
 		var buf [256]byte
 		n, _ := resp.Body.Read(buf[:])
@@ -62,22 +61,11 @@ func httpRegister(t *testing.T, addr, svcid, upstream string, services []string)
 	require.True(t, ok, "first line missing nid: %v", initial)
 	require.NotEmpty(t, gotNid)
 
-	readLine = func() (map[string]any, error) {
-		line, err := reader.ReadBytes('\n')
-		if err != nil {
-			return nil, err
-		}
-		var v map[string]any
-		if err := json.Unmarshal(line, &v); err != nil {
-			return nil, err
-		}
-		return v, nil
-	}
 	release = func() {
 		_ = resp.Body.Close()
 		tr.CloseIdleConnections()
 	}
-	return gotNid, readLine, release
+	return gotNid, release
 }
 
 // TestHTTPAdmin_RegisterHappyPath pins the core flow: a JSON POST opens
@@ -89,7 +77,7 @@ func TestHTTPAdmin_RegisterHappyPath(t *testing.T) {
 
 	upstream := startUpstreamEcho(t, &echoSrv{id: "X"})
 
-	nid, _, release := httpRegister(t, sc.HTTPAdminAddr(), "svcH", upstream, []string{"echo.Echo"})
+	nid, release := httpRegister(t, sc.HTTPAdminAddr(), "svcH", upstream, []string{"echo.Echo"})
 	defer release()
 	assert.Equal(t, sc.Nid(), nid, "nid in HTTP response must match sidecar's own nid")
 
@@ -108,7 +96,7 @@ func TestHTTPAdmin_DisconnectDeregisters(t *testing.T) {
 	sc := startSidecar(t, url, "http-drop")
 
 	upstream := startUpstreamEcho(t, &echoSrv{id: "X"})
-	_, _, release := httpRegister(t, sc.HTTPAdminAddr(), "svcD", upstream, []string{"echo.Echo"})
+	_, release := httpRegister(t, sc.HTTPAdminAddr(), "svcD", upstream, []string{"echo.Echo"})
 
 	sc.mu.Lock()
 	require.Equal(t, 1, len(sc.registrations))
@@ -219,7 +207,7 @@ func TestHTTPAdmin_EndToEndWithGoEgress(t *testing.T) {
 	ingress := startSidecar(t, url, "http-e2e-ingress")
 
 	upstream := startUpstreamEcho(t, &echoSrv{id: "PY"})
-	_, _, release := httpRegister(t, ingress.HTTPAdminAddr(), "svcPY", upstream, []string{"echo.Echo"})
+	_, release := httpRegister(t, ingress.HTTPAdminAddr(), "svcPY", upstream, []string{"echo.Echo"})
 	defer release()
 
 	conn := dialEgress(t, egress.EgressAddr())
@@ -250,34 +238,6 @@ func TestHTTPAdmin_Disable(t *testing.T) {
 	assert.Empty(t, sc.HTTPAdminAddr(), "HTTPAdminAddr() should be empty when disabled")
 }
 
-// TestHTTPAdmin_KeepaliveAck exercises the streaming ack channel. We
-// reduce the keepalive interval via a package-level test hook so we
-// don't have to wait the production 30s.
-func TestHTTPAdmin_KeepaliveAck(t *testing.T) {
-	old := setHTTPAdminKeepalive(80 * time.Millisecond)
-	defer setHTTPAdminKeepalive(old)
-
-	url := runEmbeddedNATS(t)
-	sc := startSidecar(t, url, "http-keepalive")
-	upstream := startUpstreamEcho(t, &echoSrv{id: "K"})
-
-	_, readLine, release := httpRegister(t, sc.HTTPAdminAddr(), "svcK", upstream, []string{"echo.Echo"})
-	defer release()
-
-	// At least two acks within 500ms means the ticker really fires
-	// at the configured cadence.
-	var seen int
-	deadline := time.Now().Add(800 * time.Millisecond)
-	for time.Now().Before(deadline) && seen < 2 {
-		line, err := readLine()
-		require.NoError(t, err)
-		if _, ok := line["ack"]; ok {
-			seen++
-		}
-	}
-	assert.GreaterOrEqual(t, seen, 2, "expected at least 2 keepalive acks; saw %d", seen)
-}
-
 // TestHTTPAdmin_ConcurrentRegistrations is a small stress test —
 // ten goroutines register simultaneously, each holds its connection
 // briefly, and we assert the registrations map grows to ten and
@@ -295,7 +255,7 @@ func TestHTTPAdmin_ConcurrentRegistrations(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			_, _, rel := httpRegister(t, sc.HTTPAdminAddr(), fmt.Sprintf("svc-%d", i), upstream, []string{"echo.Echo"})
+			_, rel := httpRegister(t, sc.HTTPAdminAddr(), fmt.Sprintf("svc-%d", i), upstream, []string{"echo.Echo"})
 			releases[i] = rel
 		}(i)
 	}
