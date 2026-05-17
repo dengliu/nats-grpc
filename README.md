@@ -445,13 +445,7 @@ func main() {
 | **Deployment** | No additional infrastructure | Requires LB/service mesh |
 | **Multi-tenancy** | Service IDs for isolation | Complex routing |
 
-### Use Cases
 
-1. **Microservices in Cloud**: Replace service mesh with NATS for simpler deployment
-2. **IoT/Edge Computing**: Connect devices behind NAT without VPN
-3. **Hybrid Cloud**: Seamless communication across cloud providers
-4. **Multi-region**: NATS clustering provides geographic distribution
-5. **Development**: No need for complex load balancer setup
 
 ## Advanced Features
 
@@ -561,12 +555,6 @@ See the `examples/` directory for complete working examples:
 - **[heartbeat](./examples/heartbeat/)**: Server failure detection demo
 - **[metadata](./examples/metadata/)**: Working with gRPC metadata
 - **[reflection](./examples/reflection/)**: Using gRPC server reflection
-
-## Requirements
-
-- Go 1.26 or later
-- NATS Server 2.x
-- Protocol Buffers compiler (protoc)
 
 ## Installation
 

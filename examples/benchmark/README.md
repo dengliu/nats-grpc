@@ -178,36 +178,7 @@ docker build --platform linux/amd64 --push -t us-central1-docker.pkg.dev/encoded
 helm upgrade --install nats-grpc-benchmark -n sub-agent ./helm
 ```
 
-### Helm Configuration
 
-#### Key Parameters
-
-Common scaling/resource knobs live under `common:` and are inherited by
-both the server and client StatefulSets. Per-side overrides go under
-`server:` / `client:` and take precedence over the corresponding
-`common:` value.
-
-| Parameter | Description | Default |
-|-----------|-------------|---------|
-| `image.repository` | Image repository | `nats-grpc-benchmark` |
-| `image.tag` | Image tag | `latest` |
-| `nats.url` | NATS server URL | `nats://nats:4222` |
-| `common.replicaCount` | Pods per side (server & client StatefulSets) | `100` |
-| `common.count` | Server/client goroutines spawned inside each pod | `1000` |
-| `common.natsConnections` | NATS connections per pod (shared by both sides) | `1` |
-| `common.payloadSize` | Request/response payload size in bytes | `4096` |
-| `common.resources` | CPU/memory requests & limits (default for both sides) | `4 CPU / 16 Gi` |
-| `server.enabled` | Enable server deployment | `true` |
-| `client.enabled` | Enable client deployment | `true` |
-| `client.requestTimeout` | gRPC request timeout in seconds | `30` |
-| `serviceMonitor.enabled` | Enable Prometheus ServiceMonitor | `false` |
-
-
-Any field accepted under `common:` can also be set under `server:` or
-`client:` to override that side only - e.g. `server.replicaCount=10`,
-`client.payloadSize=8192`, `server.resources.requests.cpu="2"`.
-
-See `helm/values.yaml` for all available configuration options.
 
 ### Scaling on Kubernetes
 
@@ -306,29 +277,6 @@ scrape_configs:
       - targets: ['localhost:9091']
 ```
 
-Start Prometheus:
-```bash
-prometheus --config.file=prometheus.yml
-```
-
-Access the Prometheus UI at http://localhost:9090
-
-### Example Queries
-
-```promql
-# Total requests per second (server-side)
-rate(grpc_server_requests_total[1m])
-
-# Average request duration
-histogram_quantile(0.95, rate(grpc_client_request_duration_seconds_bucket[1m]))
-
-# Error rate
-rate(grpc_client_requests_total{status="error"}[1m])
-
-# Success rate
-rate(grpc_client_requests_total{status="success"}[1m])
-```
-
 ## Performance Tuning
 
 For large-scale benchmarks (1000+ clients), consider:
@@ -348,34 +296,3 @@ For large-scale benchmarks (1000+ clients), consider:
    - Memory usage
    - Network bandwidth
    - Open file descriptors
-
-## Troubleshooting
-
-### Local Development
-
-#### Too many open files
-
-```bash
-# Increase file descriptor limit
-ulimit -n 10000
-```
-
-#### NATS connection errors
-
-- Ensure NATS server is running: `nats-server`
-- Check NATS server logs for errors
-- Verify `--nats-url` flag is correct
-
-#### Metrics not showing
-
-- Verify metrics ports are accessible: `curl http://localhost:9090/metrics`
-- Check for port conflicts
-- Ensure clients/servers are running
-
-### Kubernetes Deployment
-
-#### Check Pod Status
-
-```bash
-kubectl get pods -l release=nats-grpc-benchmark
-```
