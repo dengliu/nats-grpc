@@ -35,14 +35,16 @@ no awareness of NATS). It picks a backend per call by stamping
 
 ## What's in here
 
-- `sidecar/` — minimal sidecar binary. Connects to NATS, listens on a
-  loopback egress port (gRPC) and a loopback admin port (gRPC).
 - `server/` — echo backend. Stands up a real gRPC server, then calls
   `SidecarAdmin.Register` to tell the sidecar "I'm serving `echo.Echo`
   under svcid X; forward calls to me at this address."
 - `client/` — calls `SayHello` twice via the same stub, with two
   different `x-nats-svcid` headers. Each call lands on a different
   backend; the response prefix proves it.
+
+The sidecar binary itself lives in [`cmd/nats-grpc-sidecar/`](../../cmd/nats-grpc-sidecar)
+— it's a real shippable artifact, not example code. A Dockerfile sits
+next to it for container builds.
 
 ## Prerequisites
 
@@ -70,12 +72,12 @@ nats-server
 
 # Terminal 2 — sidecar 1 (will host the serviceid_1 ingress registration,
 #                          and is also where the client sends egress traffic)
-go run ./examples/sidecar/sidecar -egress 127.0.0.1:50051 -admin 127.0.0.1:50100 -nats nats://localhost:4222
+go run ./cmd/nats-grpc-sidecar -egress 127.0.0.1:50051 -admin 127.0.0.1:50100 -nats nats://localhost:4222
 
 # Terminal 3 — sidecar 2 (hosts the serviceid_2 ingress registration; a
 #                          separate admin port so the two backends don't
 #                          collide on registration)
-go run ./examples/sidecar/sidecar -egress 127.0.0.1:50052 -admin 127.0.0.1:50200 -nats nats://localhost:4222
+go run ./cmd/nats-grpc-sidecar -egress 127.0.0.1:50052 -admin 127.0.0.1:50200 -nats nats://localhost:4222
 
 # Terminal 4 — backend A (registers as serviceid_1 against sidecar 1)
 go run ./examples/sidecar/server -svcid serviceid_1 -admin 127.0.0.1:50100
@@ -158,6 +160,21 @@ A few things to try once it's running:
   -H "x-tenant: acme"` to the grpcurl call. The backend logs will show
   `x-tenant: [acme]` in its incoming metadata, but **not** `x-nats-svcid`
   — the sidecar strips its own routing fuel before forwarding.
+
+## Building the container
+
+For a Kubernetes (or any container-runtime) deployment, build the
+sidecar image from the repo root:
+
+```sh
+docker build -f cmd/nats-grpc-sidecar/Dockerfile -t nats-grpc-sidecar:latest .
+```
+
+The Dockerfile is a multi-stage build (alpine-based) that produces a
+small statically-linked image exposing ports `50051` (egress) and
+`50100` (admin). Override the bind addresses with `-egress` /
+`-admin` flags when running outside a Kubernetes pod (where loopback
+is shared across containers).
 
 ## What this example does NOT demonstrate
 

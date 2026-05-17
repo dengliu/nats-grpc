@@ -1,0 +1,11 @@
+# Keep the build context small. The Dockerfile only needs go.mod /
+# go.sum / source under cmd, pkg, and protos.
+.git
+.idea
+.vscode
+*.md
+examples/benchmark/helm
+examples/*/Dockerfile
+client
+server
+.generated
