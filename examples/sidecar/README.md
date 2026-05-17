@@ -46,6 +46,11 @@ The sidecar binary itself lives in [`cmd/nats-grpc-sidecar/`](../../cmd/nats-grp
 — it's a real shippable artifact, not example code. A Dockerfile sits
 next to it for container builds.
 
+For a Python-language version of the same registration flow, see
+[`python/`](./python/) — a minimal `heartbeat_register.py` that uses
+only `requests`, demonstrating that registration needs no `protoc` or
+nats-grpc dependency in non-Go languages.
+
 ## Prerequisites
 
 - A running NATS server. The simplest way:
