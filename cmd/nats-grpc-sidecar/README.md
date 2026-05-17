@@ -116,12 +116,17 @@ def register_with_sidecar(svcid, upstream, services):
         timeout=None,
     )
     resp.raise_for_status()
-    initial = json.loads(next(resp.iter_lines(decode_unicode=True)))
+    # Use iter_lines as the only reader on this stream. Mixing
+    # iter_lines (which buffers internally) with resp.raw.read()
+    # leaves raw in a state where read() can return b'' immediately
+    # even though the underlying TCP connection is still open.
+    lines = resp.iter_lines(decode_unicode=True)
+    initial = json.loads(next(lines))
     print(f"registered, sidecar nid = {initial['nid']}")
-    # Hold the connection — it IS the lease. resp.raw.read returns b''
-    # when the sidecar/network closes the stream, which is also when
-    # the sidecar has already deregistered our svcid.
-    while resp.raw.read(4096):
+    # The sidecar writes nothing else; the for-loop blocks on the
+    # next read and exits only when the connection drops, which is
+    # also when the sidecar has already deregistered our svcid.
+    for _ in lines:
         pass
 
 # Run in a background thread so the app's gRPC server can do real work.

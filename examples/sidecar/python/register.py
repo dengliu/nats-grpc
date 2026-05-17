@@ -91,18 +91,22 @@ def register_and_hold(
     resp = requests.post(admin_url, json=body, stream=True, timeout=None)
     resp.raise_for_status()
 
-    # The sidecar writes exactly one line ({"nid":"..."}) and then
-    # nothing — the open connection IS the lease.
-    first = next(resp.iter_lines(decode_unicode=True))
+    # Use iter_lines as the SOLE reader on this stream — it buffers
+    # over resp.raw, and mixing it with resp.raw.read() leaves raw
+    # in a state where read() can return b'' immediately even though
+    # the underlying connection is still open.
+    lines = resp.iter_lines(decode_unicode=True)
+    first = next(lines)
     msg = json.loads(first)
     print(f"[{now_iso()}] registered with sidecar nid = {msg['nid']}")
     print(f"[{now_iso()}] holding connection (the registration lease) — Ctrl-C to deregister")
 
-    # Block until the connection drops. resp.raw.read() with no size
-    # is the idiomatic "drain to EOF" form in `requests` — it returns
-    # b'' as soon as the server closes the stream (which is also when
-    # the sidecar has deregistered our svcid).
-    resp.raw.read()
+    # The sidecar holds the stream open without writing further
+    # lines, so this for-loop blocks on the next read. It exits only
+    # when the connection drops (sidecar shutdown, network drop, or
+    # local Ctrl-C closing the socket).
+    for _ in lines:
+        pass
     print(f"[{now_iso()}] registration connection closed")
 
 
