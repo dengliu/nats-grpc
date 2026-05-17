@@ -87,6 +87,17 @@ services:
       sidecar-go-server: { condition: service_started }
     environment:
       - SVCID=go-server
+    # Each server writes /tmp/ready *after* its registration is
+    # accepted by the sidecar (and therefore after the sidecar has
+    # opened its NATS subscriptions). The healthcheck reports the
+    # registration state; clients gate on it so the first RPC can't
+    # race the registration.
+    healthcheck:
+      test: ["CMD", "test", "-f", "/tmp/ready"]
+      interval: 500ms
+      timeout: 500ms
+      retries: 60
+      start_period: 1s
 
   py-server:
     build:
@@ -97,6 +108,12 @@ services:
       sidecar-py-server: { condition: service_started }
     environment:
       - SVCID=python-server
+    healthcheck:
+      test: ["CMD", "test", "-f", "/tmp/ready"]
+      interval: 500ms
+      timeout: 500ms
+      retries: 60
+      start_period: 1s
 
   # ── Clients ───────────────────────────────────────────────────────────
   # Each client dials its sidecar's egress port (127.0.0.1:50051) and
@@ -110,8 +127,12 @@ services:
     network_mode: "service:sidecar-go-client"
     depends_on:
       sidecar-go-client: { condition: service_started }
-      go-server: { condition: service_started }
-      py-server: { condition: service_started }
+      # service_healthy gates the client on the server's
+      # /tmp/ready signal — i.e. on the server having actually
+      # finished its registration handshake with its sidecar. This
+      # eliminates the first-RPC-races-registration window.
+      go-server: { condition: service_healthy }
+      py-server: { condition: service_healthy }
 
   py-client:
     build:
@@ -120,5 +141,5 @@ services:
     network_mode: "service:sidecar-py-client"
     depends_on:
       sidecar-py-client: { condition: service_started }
-      go-server: { condition: service_started }
-      py-server: { condition: service_started }
+      go-server: { condition: service_healthy }
+      py-server: { condition: service_healthy }

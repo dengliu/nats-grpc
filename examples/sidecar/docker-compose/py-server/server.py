@@ -53,6 +53,11 @@ def register_with_sidecar(admin_url: str, svcid: str, upstream: str) -> None:
             first = next(lines)
             msg = json.loads(first)
             print(f"registered as svcid={svcid!r}  sidecar.nid={msg['nid']}", flush=True)
+            # Signal "I've registered" to docker-compose's healthcheck.
+            # The client containers gate on this so they don't fire
+            # their first RPC before the sidecar's NATS subscriptions
+            # are live.
+            open("/tmp/ready", "w").close()
             # No further lines are expected — the sidecar holds the
             # stream open without writing anything more. The for loop
             # blocks on the next chunk read, which only returns when

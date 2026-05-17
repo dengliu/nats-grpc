@@ -61,6 +61,13 @@ func registerWithSidecar(ctx context.Context, adminURL, svcid, upstream string) 
 	_ = json.Unmarshal(first, &initial)
 	log.Printf("registered as svcid=%q  sidecar.nid=%s", svcid, initial.Nid)
 
+	// Signal "I've registered" to docker-compose's healthcheck. The
+	// client containers gate on this so they don't fire their first
+	// RPC before the sidecar's NATS subscriptions are live.
+	if err := os.WriteFile("/tmp/ready", nil, 0o644); err != nil {
+		log.Printf("write /tmp/ready: %v", err)
+	}
+
 	// io.Copy(io.Discard, reader) is the canonical "drain to EOF"
 	// stdlib idiom — the open HTTP connection IS the lease.
 	_, _ = io.Copy(io.Discard, reader)
