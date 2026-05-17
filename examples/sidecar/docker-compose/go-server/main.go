@@ -1,0 +1,105 @@
+// Go echo backend for the docker-compose demo. Listens on
+// 127.0.0.1:8080, registers itself with the sidecar via HTTP/JSON
+// admin, and answers every request with the original message
+// suffixed by " I am go server".
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+
+	"github.com/cloudwebrtc/nats-grpc/examples/protos/echo"
+	"google.golang.org/grpc"
+)
+
+type echoServer struct {
+	echo.UnimplementedEchoServer
+}
+
+func (echoServer) SayHello(_ context.Context, req *echo.HelloRequest) (*echo.HelloReply, error) {
+	reply := req.Msg + " I am go server"
+	log.Printf("SayHello in=%q  out=%q", req.Msg, reply)
+	return &echo.HelloReply{Msg: reply}, nil
+}
+
+func registerWithSidecar(ctx context.Context, adminURL, svcid, upstream string) error {
+	body, _ := json.Marshal(map[string]any{
+		"svcid":    svcid,
+		"upstream": upstream,
+		"services": []string{"echo.Echo"},
+	})
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, adminURL, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	tr := &http.Transport{DisableKeepAlives: true}
+	resp, err := (&http.Client{Transport: tr, Timeout: 0}).Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		buf, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return fmt.Errorf("register: HTTP %d: %s", resp.StatusCode, buf)
+	}
+	reader := bufio.NewReader(resp.Body)
+	first, err := reader.ReadBytes('\n')
+	if err != nil {
+		return err
+	}
+	var initial struct {
+		Nid string `json:"nid"`
+	}
+	_ = json.Unmarshal(first, &initial)
+	log.Printf("registered as svcid=%q  sidecar.nid=%s", svcid, initial.Nid)
+
+	// io.Copy(io.Discard, reader) is the canonical "drain to EOF"
+	// stdlib idiom — the open HTTP connection IS the lease.
+	_, _ = io.Copy(io.Discard, reader)
+	return io.EOF
+}
+
+func env(k, def string) string {
+	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	return def
+}
+
+func main() {
+	svcid := env("SVCID", "go-server")
+	listen := env("LISTEN", "127.0.0.1:8080")
+	adminURL := env("ADMIN_URL", "http://127.0.0.1:50101/v1/register")
+
+	lis, err := net.Listen("tcp", listen)
+	if err != nil {
+		log.Fatalf("listen %s: %v", listen, err)
+	}
+	srv := grpc.NewServer()
+	echo.RegisterEchoServer(srv, echoServer{})
+	go func() { _ = srv.Serve(lis) }()
+	log.Printf("go echo server listening on %s", lis.Addr())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	regDone := make(chan error, 1)
+	go func() { regDone <- registerWithSidecar(ctx, adminURL, svcid, lis.Addr().String()) }()
+
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	select {
+	case <-sigs:
+		log.Printf("shutting down")
+	case err := <-regDone:
+		log.Printf("registration ended: %v", err)
+	}
+	cancel()
+	srv.GracefulStop()
+}

@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+# Proto stubs are generated at image-build time inside containers.
+echo_pb2.py
+echo_pb2_grpc.py

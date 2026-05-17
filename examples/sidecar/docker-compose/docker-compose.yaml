@@ -1,0 +1,124 @@
+# End-to-end nats-grpc sidecar demo over docker-compose.
+#
+# Topology — one NATS server, four sidecars (one per app, sharing
+# network namespace with their app via `network_mode: "service:..."`
+# — the docker-compose analog of a Kubernetes pod-mate), and four
+# apps total (two backends + two clients):
+#
+#   ┌────────────────┐
+#   │ nats           │ :4222
+#   └────────────────┘
+#         ▲
+#         │   ┌──────────────────────────────┐    ┌──────────────────────────────┐
+#         ├───┤ sidecar-go-server  ⇄  go-server │ │ sidecar-py-server  ⇄  py-server │
+#         │   │ svcid=go-server  upstream :8080│ │ svcid=python-server upstr :8080│
+#         │   └──────────────────────────────┘    └──────────────────────────────┘
+#         │
+#         │   ┌──────────────────────────────┐    ┌──────────────────────────────┐
+#         └───┤ sidecar-go-client  ⇄  go-client │ │ sidecar-py-client  ⇄  py-client │
+#             │ (egress only — calls both svcs) │ │ (egress only — calls both svcs)│
+#             └──────────────────────────────┘    └──────────────────────────────┘
+#
+# Each client makes a request every 3 seconds, alternating between
+# python-server and go-server purely via the x-nats-svcid metadata
+# header. Backends are plain gRPC — they have no idea NATS exists.
+
+services:
+
+  # ── NATS broker ───────────────────────────────────────────────────────
+  nats:
+    image: nats:2.10-alpine
+    command: ["-m", "8222"]   # enable monitoring port for the healthcheck
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8222/healthz || exit 1"]
+      interval: 1s
+      timeout: 1s
+      retries: 30
+      start_period: 2s
+
+  # ── Sidecars ──────────────────────────────────────────────────────────
+  # All four sidecars run the same binary with different nids. They
+  # listen on their default loopback ports inside their respective
+  # network namespaces (50051 egress, 50101 http-admin).
+
+  sidecar-go-server:
+    build:
+      context: ../../..
+      dockerfile: cmd/nats-grpc-sidecar/Dockerfile
+    command: ["-nats=nats://nats:4222", "-nid=sc-go-server"]
+    depends_on:
+      nats: { condition: service_healthy }
+
+  sidecar-py-server:
+    build:
+      context: ../../..
+      dockerfile: cmd/nats-grpc-sidecar/Dockerfile
+    command: ["-nats=nats://nats:4222", "-nid=sc-py-server"]
+    depends_on:
+      nats: { condition: service_healthy }
+
+  sidecar-go-client:
+    build:
+      context: ../../..
+      dockerfile: cmd/nats-grpc-sidecar/Dockerfile
+    command: ["-nats=nats://nats:4222", "-nid=sc-go-client"]
+    depends_on:
+      nats: { condition: service_healthy }
+
+  sidecar-py-client:
+    build:
+      context: ../../..
+      dockerfile: cmd/nats-grpc-sidecar/Dockerfile
+    command: ["-nats=nats://nats:4222", "-nid=sc-py-client"]
+    depends_on:
+      nats: { condition: service_healthy }
+
+  # ── Servers ───────────────────────────────────────────────────────────
+  # Each server shares its sidecar's network namespace, listens on
+  # 127.0.0.1:8080, and registers via POST 127.0.0.1:50101/v1/register
+  # with svcid as a CLI arg / env var.
+
+  go-server:
+    build:
+      context: ../../..
+      dockerfile: examples/sidecar/docker-compose/go-server/Dockerfile
+    network_mode: "service:sidecar-go-server"
+    depends_on:
+      sidecar-go-server: { condition: service_started }
+    environment:
+      - SVCID=go-server
+
+  py-server:
+    build:
+      context: ../../..
+      dockerfile: examples/sidecar/docker-compose/py-server/Dockerfile
+    network_mode: "service:sidecar-py-server"
+    depends_on:
+      sidecar-py-server: { condition: service_started }
+    environment:
+      - SVCID=python-server
+
+  # ── Clients ───────────────────────────────────────────────────────────
+  # Each client dials its sidecar's egress port (127.0.0.1:50051) and
+  # alternates between python-server and go-server every 3 seconds
+  # via the x-nats-svcid metadata header.
+
+  go-client:
+    build:
+      context: ../../..
+      dockerfile: examples/sidecar/docker-compose/go-client/Dockerfile
+    network_mode: "service:sidecar-go-client"
+    depends_on:
+      sidecar-go-client: { condition: service_started }
+      go-server: { condition: service_started }
+      py-server: { condition: service_started }
+
+  py-client:
+    build:
+      context: ../../..
+      dockerfile: examples/sidecar/docker-compose/py-client/Dockerfile
+    network_mode: "service:sidecar-py-client"
+    depends_on:
+      sidecar-py-client: { condition: service_started }
+      go-server: { condition: service_started }
+      py-server: { condition: service_started }
