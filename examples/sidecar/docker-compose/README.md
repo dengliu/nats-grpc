@@ -45,7 +45,6 @@ talking over loopback (`127.0.0.1`).
 From the repo root:
 
 ```sh
-cd examples/sidecar/docker-compose
 docker compose up --build
 ```
 
@@ -77,20 +76,21 @@ py-server      | registered as svcid='python-server'  sidecar.nid=sc-py-server
 ```
 
 Then once per 3 seconds, each client emits a request and you see
-the matched backend log it:
+the matched backend log it. Requests are `<sender> -> <target> #<N>`;
+replies swap sender/target with the same counter:
 
 ```
-go-client      | → python-server  reply="Hi Python Server, I am Go Client request #1 I am python server"
-py-server      | SayHello in='Hi Python Server, I am Go Client request #1'  out='Hi Python Server, I am Go Client request #1 I am python server'
+go-client | go-client -> py-server #1   ⇒  py-server -> go-client #1
+py-server | SayHello in='go-client -> py-server #1'   out='py-server -> go-client #1'
 
-py-client      | → python-server  reply='Hi Python Server, I am Python Client request #1 I am python server'
-py-server      | SayHello in='Hi Python Server, I am Python Client request #1'  out='Hi Python Server, I am Python Client request #1 I am python server'
+py-client | py-client -> py-server #1   ⇒  py-server -> py-client #1
+py-server | SayHello in='py-client -> py-server #1'   out='py-server -> py-client #1'
 
-go-client      | → go-server      reply="Hi Go Server, I am Go Client request #2 I am go server"
-go-server      | SayHello in="Hi Go Server, I am Go Client request #2"  out="Hi Go Server, I am Go Client request #2 I am go server"
+go-client | go-client -> go-server #2   ⇒  go-server -> go-client #2
+go-server | SayHello in="go-client -> go-server #2"  out="go-server -> go-client #2"
 
-py-client      | → go-server      reply='Hi Go Server, I am Python Client request #2 I am go server'
-go-server      | SayHello in="Hi Go Server, I am Python Client request #2"  out="Hi Go Server, I am Python Client request #2 I am go server"
+py-client | py-client -> go-server #2   ⇒  go-server -> py-client #2
+go-server | SayHello in="py-client -> go-server #2"  out="go-server -> py-client #2"
 ```
 
 Each client alternates: odd-numbered requests go to `python-server`,

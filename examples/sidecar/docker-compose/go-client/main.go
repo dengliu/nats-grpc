@@ -1,8 +1,11 @@
 // Go client for the docker-compose demo. Dials the sidecar's egress
 // port on loopback (shared network namespace via
 // network_mode: service:sidecar-go-client) and sends one SayHello
-// every 3 seconds, alternating between python-server (odd #) and
+// every 3 seconds, alternating between py-server (odd #) and
 // go-server (even #) purely via the x-nats-svcid metadata header.
+//
+// Wire format: requests are "<self> -> <target> #<N>", replies come
+// back as "<target> -> <self> #<N>".
 package main
 
 import (
@@ -19,6 +22,8 @@ import (
 
 func main() {
 	const egress = "127.0.0.1:50051"
+	const selfLabel = "go-client"
+
 	conn, err := grpc.NewClient(egress, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		log.Fatalf("dial sidecar egress %s: %v", egress, err)
@@ -27,17 +32,17 @@ func main() {
 	cli := echo.NewEchoClient(conn)
 
 	type target struct {
-		svcid string
-		label string
+		svcid string // routing key on the wire (x-nats-svcid header)
+		label string // short human-readable name used in the message
 	}
 	targets := []target{
-		{svcid: "python-server", label: "Python Server"},
-		{svcid: "go-server", label: "Go Server"},
+		{svcid: "python-server", label: "py-server"},
+		{svcid: "go-server", label: "go-server"},
 	}
 
 	for n := 1; ; n++ {
 		t := targets[(n-1)%len(targets)]
-		msg := fmt.Sprintf("Hi %s, I am Go Client request #%d", t.label, n)
+		msg := fmt.Sprintf("%s -> %s #%d", selfLabel, t.label, n)
 
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		ctx = metadata.AppendToOutgoingContext(ctx, "x-nats-svcid", t.svcid)
@@ -46,7 +51,7 @@ func main() {
 		if err != nil {
 			log.Printf("→ %-13s  error: %v", t.svcid, err)
 		} else {
-			log.Printf("→ %-13s  reply=%q", t.svcid, resp.Msg)
+			log.Printf("%s  ⇒  %s", msg, resp.Msg)
 		}
 		time.Sleep(3 * time.Second)
 	}

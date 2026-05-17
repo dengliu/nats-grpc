@@ -2,8 +2,11 @@
 
 Dials the sidecar's egress port on 127.0.0.1:50051 (shared network
 namespace via network_mode: service:sidecar-py-client) and sends one
-SayHello every 3 seconds, alternating between python-server (odd #)
-and go-server (even #) purely via the x-nats-svcid metadata header.
+SayHello every 3 seconds, alternating between py-server (odd #) and
+go-server (even #) purely via the x-nats-svcid metadata header.
+
+Wire format: requests are '<self> -> <target> #<N>', replies come
+back as '<target> -> <self> #<N>'.
 """
 from __future__ import annotations
 
@@ -17,9 +20,11 @@ import echo_pb2
 import echo_pb2_grpc
 
 
+SELF = "py-client"
+# (svcid on the wire, short label used in the message body)
 TARGETS = [
-    ("python-server", "Python Server"),
-    ("go-server",     "Go Server"),
+    ("python-server", "py-server"),
+    ("go-server",     "go-server"),
 ]
 
 
@@ -41,16 +46,16 @@ def main() -> int:
     while True:
         n += 1
         svcid, label = TARGETS[(n - 1) % len(TARGETS)]
-        msg = f"Hi {label}, I am Python Client request #{n}"
+        msg = f"{SELF} -> {label} #{n}"
         try:
             resp = stub.SayHello(
                 echo_pb2.HelloRequest(msg=msg),
                 metadata=[("x-nats-svcid", svcid)],
                 timeout=3.0,
             )
-            print(f"→ {svcid:<13s}  reply={resp.msg!r}", flush=True)
+            print(f"{msg}  ⇒  {resp.msg}", flush=True)
         except grpc.RpcError as e:
-            print(f"→ {svcid:<13s}  error: {e.code().name}: {e.details()}",
+            print(f"{msg}  error: {e.code().name}: {e.details()}",
                   flush=True)
         time.sleep(3)
 

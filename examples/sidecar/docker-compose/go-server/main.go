@@ -16,20 +16,44 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/cloudwebrtc/nats-grpc/examples/protos/echo"
 	"google.golang.org/grpc"
 )
 
+const selfLabel = "go-server"
+
 type echoServer struct {
 	echo.UnimplementedEchoServer
 }
 
 func (echoServer) SayHello(_ context.Context, req *echo.HelloRequest) (*echo.HelloReply, error) {
-	reply := req.Msg + " I am go server"
+	reply := swapSenderTarget(req.Msg, selfLabel)
 	log.Printf("SayHello in=%q  out=%q", req.Msg, reply)
 	return &echo.HelloReply{Msg: reply}, nil
+}
+
+// swapSenderTarget rewrites a request of the form
+// "<sender> -> <target> #<N>" as "<self> -> <sender> #<N>".
+// The target component is discarded — by construction it equals
+// self anyway (the sidecar only delivers messages addressed to our
+// svcid). Inputs that don't match the format are returned as-is,
+// keeping the demo running on unexpected payloads.
+func swapSenderTarget(req, self string) string {
+	senderEnd := strings.Index(req, " -> ")
+	if senderEnd < 0 {
+		return req
+	}
+	rest := req[senderEnd+len(" -> "):]
+	hashIdx := strings.Index(rest, " #")
+	if hashIdx < 0 {
+		return req
+	}
+	// rest[hashIdx:] is " #<N>" with the leading space — splice it
+	// straight back in so the output reads "self -> sender #N".
+	return self + " -> " + req[:senderEnd] + rest[hashIdx:]
 }
 
 func registerWithSidecar(ctx context.Context, adminURL, svcid, upstream string) error {

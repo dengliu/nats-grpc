@@ -21,9 +21,27 @@ import echo_pb2
 import echo_pb2_grpc
 
 
+SELF_LABEL = "py-server"
+
+
+def swap_sender_target(req: str, self_label: str) -> str:
+    """Rewrite '<sender> -> <target> #<N>' as '<self> -> <sender> #<N>'.
+
+    The target component is discarded — by construction it equals
+    self anyway (the sidecar only delivers messages addressed to our
+    svcid). Inputs that don't match the format are returned as-is.
+    """
+    try:
+        sender, rest = req.split(" -> ", 1)
+        _target, counter = rest.split(" #", 1)
+    except ValueError:
+        return req
+    return f"{self_label} -> {sender} #{counter}"
+
+
 class EchoServicer(echo_pb2_grpc.EchoServicer):
     def SayHello(self, request, context):
-        reply = f"{request.msg} I am python server"
+        reply = swap_sender_target(request.msg, SELF_LABEL)
         print(f"SayHello in={request.msg!r}  out={reply!r}", flush=True)
         return echo_pb2.HelloReply(msg=reply)
 
